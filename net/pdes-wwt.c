@@ -386,12 +386,16 @@ void wwt_sync_check(){
             // TODO again dependant to 2 nodes
             // TODO make this more general to not be reliant on conservative boundaries
             // TODO factor it out like the checkpoint portion
-            if (engine->ready_to_exit_neighbors >= 1 && engine->ready_to_exit){
+            if (engine->ready_to_exit_neighbors >= 1 && engine->ready_to_exit && !engine->permitted_to_exit){
                 engine->permitted_to_exit = true;
                 // Send PERMISSION_TO_END_EMULATION message to neighbor
                 Message permission_to_end_msg = create_message(NULL, 0, PERMISSION_TO_END_EMULATION, get_universal_virtual_time(engine));
                 pdes_comm_send(engine->comm, &permission_to_end_msg);
                 printf("Master received intent to end emulation message, permitting neighbor to exit and sending permission message back.\n");
+                // permitted_to_exit just flipped — flush any END deferred by
+                // notify_neighbours_of_end (Flexus may have asked to exit
+                // before the handshake completed).
+                _send_end_if_handshake_complete(engine);
             }
         }
 

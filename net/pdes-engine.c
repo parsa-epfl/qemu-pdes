@@ -77,6 +77,8 @@ PDESEngine *pdes_engine_create(
     engine->ready_to_exit_neighbors = 0;
     engine->permitted_to_exit = false;
     engine->ready_to_exit = false;
+    engine->end_message_sent = false;
+    engine->intent_sent = false;
 
 
 
@@ -96,16 +98,22 @@ PDESEngine *pdes_engine_create(
 }
 
 
-void notify_neighbours_of_end(PDESEngine *engine){
-    if(engine->notified_neighbors_for_exit){
-        return;
-    }
-    engine->notified_neighbors_for_exit = true;
-
-    printf("==========================================Existing PDES Engine...==========================================\n");
+// Idempotent — emit END once permitted_to_exit is set. Decoupled from
+// notify_neighbours_of_end so we can fire it from the handshake path
+// without waiting for libqflex_stop.
+void _send_end_if_handshake_complete(PDESEngine *engine){
+    if(!engine->permitted_to_exit) return;
+    if(engine->end_message_sent) return;
+    engine->end_message_sent = true;
     Message mssg = create_message(NULL, 0, END_OF_EMULATION, get_current_virtual_for_destroy_message(engine));
     pdes_comm_send(engine->comm, &mssg);
-    printf("==========================================PDES Engine exited.==========================================\n");
+    printf("END_OF_EMULATION sent.\n");
+}
+
+void notify_neighbours_of_end(PDESEngine *engine){
+    if(engine->notified_neighbors_for_exit) return;
+    engine->notified_neighbors_for_exit = true;
+    _send_end_if_handshake_complete(engine);
 }
 // TODO clean this up, destroying needs clean up
 void destroy_strategy(){
@@ -198,13 +206,13 @@ void process_message(PDESEngine *engine, Message *msg) {
         }
     }
     if (msg->type == PERMISSION_TO_END_EMULATION){
-        printf("Received permission to end emulation message from master, setting permitted_to_exit to true.\n");
+        printf("Received permission to end emulation; setting permitted_to_exit.\n");
         engine->permitted_to_exit = true;
+        _send_end_if_handshake_complete(engine);
     }
     if (msg->type == END_OF_EMULATION){
-        printf("PDES Engine received end of emulation message, finishing simulation.\n");
-        // TODO add any cleanup needed here
-        pdes_engine_destroy(engine);
+        printf("Received END_OF_EMULATION; pair_has_finished.\n");
+        qatomic_set(&engine->pair_has_finished, true);
     }
     if (msg->type==DRAIN_START){
         printf("PDES Engine received drain end message, marking drained as true.\n");
@@ -444,27 +452,20 @@ void finish_initiate_checkpoint(PDESEngine *engine){
 
 bool can_stop(PDESEngine *engine){
     if (!engine->master){
-        // Send INTENT_TO_END_EMULATION message to master
-        // TODO make all these bool flags atomic:
-
-        // TODO these message are specific to 2 nodes, need to generalize for more nodes and send only to master
-        if(!engine->notified_neighbors_for_exit){
-            Message intent_to_end_msg = create_message(NULL, 0, INTENT_TO_END_EMULATION, get_universal_virtual_time(engine));
-            pdes_comm_send(engine->comm, &intent_to_end_msg);
-            printf("Sent intent to end emulation message to master, waiting for permission to exit.\n");
-            engine->notified_neighbors_for_exit = true;
+        if(!engine->intent_sent){
+            Message intent_msg = create_message(NULL, 0, INTENT_TO_END_EMULATION, get_universal_virtual_time(engine));
+            pdes_comm_send(engine->comm, &intent_msg);
+            engine->intent_sent = true;
         }
-    }else{
-
-        bool can_end = engine->ready_to_exit_neighbors >= 1;
-        if(can_end){
-            engine->permitted_to_exit = true;
-            // Send PERMISSION_TO_END_EMULATION message to neighbor
-            Message permission_to_end_msg = create_message(NULL, 0, PERMISSION_TO_END_EMULATION, get_universal_virtual_time(engine));
-            pdes_comm_send(engine->comm, &permission_to_end_msg);
-            printf("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!Allowing neighbor to exit as master and sending permission message back.!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n");
-        }
+    } else if(engine->ready_to_exit_neighbors >= 1 && !engine->permitted_to_exit){
+        engine->permitted_to_exit = true;
+        Message permission_msg = create_message(NULL, 0, PERMISSION_TO_END_EMULATION, get_universal_virtual_time(engine));
+        pdes_comm_send(engine->comm, &permission_msg);
+        _send_end_if_handshake_complete(engine);
     }
     engine->ready_to_exit = true;
-    return engine->permitted_to_exit;
+    // Both sides exit together: only when our handshake is permitted AND
+    // peer's END has arrived. The natural WWT barrier keeps both ticking
+    // (and exchanging sync) up to that point.
+    return engine->permitted_to_exit && engine->pair_has_finished;
 }

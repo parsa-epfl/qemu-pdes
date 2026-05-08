@@ -81,6 +81,8 @@ struct PDESEngine {
     int ready_to_exit_neighbors;
     bool permitted_to_exit;
     bool ready_to_exit;
+    bool end_message_sent;
+    bool intent_sent;
 };
 
 PDESEngine *pdes_engine_create(
@@ -187,5 +189,12 @@ void finish_initiate_checkpoint(PDESEngine *engine);
 
 void destroy_strategy();
 bool can_stop(PDESEngine *engine);
+// Internal: emit the deferred END_OF_EMULATION wire message iff Flexus has
+// signalled it wants to exit AND the bilateral INTENT/PERMISSION handshake
+// has completed (permitted_to_exit is true). Idempotent. Called from places
+// that flip permitted_to_exit (master can_stop, follower PERMISSION arm,
+// wwt_sync_check exit handshake) so the END goes out as soon as the gate
+// opens.
+void _send_end_if_handshake_complete(PDESEngine *engine);
 
 #endif
