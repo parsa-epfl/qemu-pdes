@@ -341,6 +341,17 @@ void wwt_sync_check(){
     while(waiting){
         // Poll for messages while waiting to avoid blocking message processing
         pdes_engine_poll(wwt_engine->engine);
+        // Peer's END_OF_EMULATION arrived — no more sync messages will come.
+        // Unpause local Flexus and drop the sync requirement so this loop
+        // exits, post-loop quantum bookkeeping runs, and Flexus drains to
+        // its own stop cycle to call terminateSimulation (writes end.log)
+        // and exit naturally — instead of spinning here forever.
+        if (qatomic_read(&wwt_engine->engine->pair_has_finished)){
+            if (wwt_engine->should_sync){
+                pdes_play(wwt_engine->engine);
+            }
+            wwt_engine->should_sync = false;
+        }
         waiting = is_waiting_for_quanta(wwt_engine);
     }
     // printf("WWT: Finished waiting for quanta for round %lu at virtual time %lu ns, proceeding with quantum sync.\n", wwt_engine->current_quantum_round, current_time);
