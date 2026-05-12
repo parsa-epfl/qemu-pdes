@@ -102,17 +102,19 @@ PDESEngine *pdes_engine_create(
 // notify_neighbours_of_end so we can fire it from the handshake path
 // without waiting for libqflex_stop.
 void _send_end_if_handshake_complete(PDESEngine *engine){
-    if(!engine->permitted_to_exit) return;
-    if(engine->end_message_sent) return;
-    engine->end_message_sent = true;
+    /* Both flags are set across threads (main thread on the PERMISSION arm,
+     * Flexus thread in can_stop, main thread in wwt_sync_check master arm)
+     * — read/write atomically so the "send END exactly once after our
+     * permitted_to_exit flips" invariant survives concurrent callers. */
+    if(!qatomic_read(&engine->permitted_to_exit)) return;
+    if(qatomic_xchg(&engine->end_message_sent, true)) return;
     Message mssg = create_message(NULL, 0, END_OF_EMULATION, get_current_virtual_for_destroy_message(engine));
     pdes_comm_send(engine->comm, &mssg);
     printf("END_OF_EMULATION sent.\n");
 }
 
 void notify_neighbours_of_end(PDESEngine *engine){
-    if(engine->notified_neighbors_for_exit) return;
-    engine->notified_neighbors_for_exit = true;
+    if(qatomic_xchg(&engine->notified_neighbors_for_exit, true)) return;
     _send_end_if_handshake_complete(engine);
 }
 // TODO clean this up, destroying needs clean up
@@ -202,16 +204,27 @@ void process_message(PDESEngine *engine, Message *msg) {
     if(msg->type == INTENT_TO_END_EMULATION){
         if (engine->master){
             printf("Received intent to end emulation message from neighbor, permitting neighbor to exit and sending permission message back.\n");
-            engine->ready_to_exit_neighbors++;
+            qatomic_inc(&engine->ready_to_exit_neighbors);
         }
     }
     if (msg->type == PERMISSION_TO_END_EMULATION){
         printf("Received permission to end emulation; setting permitted_to_exit.\n");
-        engine->permitted_to_exit = true;
+        qatomic_set(&engine->permitted_to_exit, true);
         _send_end_if_handshake_complete(engine);
     }
     if (msg->type == END_OF_EMULATION){
         printf("Received END_OF_EMULATION; pair_has_finished.\n");
+        /* Protocol invariant: peer only sends END after the INTENT/PERMISSION
+         * handshake completes. That means our own permitted_to_exit is
+         * already set — master flipped it when granting permission (before
+         * _send_end_if_handshake_complete fires); follower flipped it on
+         * the PERMISSION arm above, which the FIFO shm ring delivers before
+         * the master's END. If this assert fires, the END handshake is
+         * broken upstream — peer exited prematurely. */
+        assert(qatomic_read(&engine->permitted_to_exit)
+               && "process_message: got END_OF_EMULATION before our "
+                  "permitted_to_exit was set. Peer cannot have sent END "
+                  "yet per the INTENT/PERMISSION/END protocol.");
         qatomic_set(&engine->pair_has_finished, true);
     }
     if (msg->type==DRAIN_START){
@@ -451,21 +464,27 @@ void finish_initiate_checkpoint(PDESEngine *engine){
 }
 
 bool can_stop(PDESEngine *engine){
+    /* can_stop runs on the Flexus thread; the flags it touches (and the
+     * counter it reads) are also written from the main thread (process_message,
+     * wwt_sync_check master arm). Use qatomic_* so concurrent updates aren't
+     * lost. intent_sent stays local — only this function ever touches it. */
     if (!engine->master){
         if(!engine->intent_sent){
             Message intent_msg = create_message(NULL, 0, INTENT_TO_END_EMULATION, get_universal_virtual_time(engine));
             pdes_comm_send(engine->comm, &intent_msg);
             engine->intent_sent = true;
         }
-    } else if(engine->ready_to_exit_neighbors >= 1 && !engine->permitted_to_exit){
-        engine->permitted_to_exit = true;
+    } else if(qatomic_read(&engine->ready_to_exit_neighbors) >= 1
+             && !qatomic_read(&engine->permitted_to_exit)){
+        qatomic_set(&engine->permitted_to_exit, true);
         Message permission_msg = create_message(NULL, 0, PERMISSION_TO_END_EMULATION, get_universal_virtual_time(engine));
         pdes_comm_send(engine->comm, &permission_msg);
         _send_end_if_handshake_complete(engine);
     }
-    engine->ready_to_exit = true;
+    qatomic_set(&engine->ready_to_exit, true);
     // Both sides exit together: only when our handshake is permitted AND
     // peer's END has arrived. The natural WWT barrier keeps both ticking
     // (and exchanging sync) up to that point.
-    return engine->permitted_to_exit && engine->pair_has_finished;
+    return qatomic_read(&engine->permitted_to_exit)
+        && qatomic_read(&engine->pair_has_finished);
 }

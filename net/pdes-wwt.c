@@ -7,6 +7,10 @@
 #include "sysemu/cpu-timers.h"
 #include "hw/core/cpu.h"
 
+#ifdef CONFIG_LIBQFLEX
+#include "middleware/libqflex/libqflex-legacy-api.h"
+#endif
+
 extern PDESWWT *singleton_wwt_engine = NULL;
 
 
@@ -341,16 +345,39 @@ void wwt_sync_check(){
     while(waiting){
         // Poll for messages while waiting to avoid blocking message processing
         pdes_engine_poll(wwt_engine->engine);
-        // Peer's END_OF_EMULATION arrived — no more sync messages will come.
-        // Unpause local Flexus and drop the sync requirement so this loop
-        // exits, post-loop quantum bookkeeping runs, and Flexus drains to
-        // its own stop cycle to call terminateSimulation (writes end.log)
-        // and exit naturally — instead of spinning here forever.
+        // Peer sent END_OF_EMULATION. Per the protocol, peer can only send
+        // END after the INTENT/PERMISSION exchange completed, which means
+        // OUR permitted_to_exit is already set — master sets it when
+        // granting permission (before _send_end_if_handshake_complete);
+        // follower sets it when receiving PERMISSION (which arrives before
+        // master's END in send order). So we were already ready to exit
+        // when peer's END landed, and the only honest thing to do is exit
+        // here instead of spinning waiting for a sync that will never come.
         if (qatomic_read(&wwt_engine->engine->pair_has_finished)){
-            if (wwt_engine->should_sync){
-                pdes_play(wwt_engine->engine);
+            assert(qatomic_read(&wwt_engine->engine->permitted_to_exit)
+                   && "wwt_sync_check: pair_has_finished is set but our "
+                      "permitted_to_exit isn't — peer sent END_OF_EMULATION "
+                      "before our handshake completed. The END handshake "
+                      "invariant is broken upstream (check process_message "
+                      "PERMISSION arm and the master arm in wwt_sync_check / "
+                      "can_stop).");
+#ifdef CONFIG_LIBQFLEX
+            if (flexus_api.stop != NULL){
+                /* Drive Flexus's terminateSimulation from the main thread.
+                 * Flexus thread is paused (pdes_pause from a prior
+                 * quanta_sync) so Flexus internals are quiescent; this is
+                 * the same path the Flexus-side stopcycle check would have
+                 * taken on its own thread once both flags were set.
+                 * terminateSimulation writes all.measurement.end.log then
+                 * exit(0)s — does not return. */
+                flexus_api.stop();
             }
-            wwt_engine->should_sync = false;
+#endif
+            /* Belt-and-suspenders: if libqflex is off or flexus_api.stop
+             * unexpectedly returned, fall through to the engine-destroy
+             * path which calls exit(0). */
+            pdes_engine_destroy(wwt_engine->engine);
+            return; /* unreachable */
         }
         waiting = is_waiting_for_quanta(wwt_engine);
     }
@@ -397,8 +424,13 @@ void wwt_sync_check(){
             // TODO again dependant to 2 nodes
             // TODO make this more general to not be reliant on conservative boundaries
             // TODO factor it out like the checkpoint portion
-            if (engine->ready_to_exit_neighbors >= 1 && engine->ready_to_exit && !engine->permitted_to_exit){
-                engine->permitted_to_exit = true;
+            /* All three flags are cross-thread (set by can_stop on the
+             * Flexus thread and the PERMISSION arm on the main thread); use
+             * qatomic_* so we don't miss an INTENT or double-flip the flag. */
+            if (qatomic_read(&engine->ready_to_exit_neighbors) >= 1
+                && qatomic_read(&engine->ready_to_exit)
+                && !qatomic_read(&engine->permitted_to_exit)){
+                qatomic_set(&engine->permitted_to_exit, true);
                 // Send PERMISSION_TO_END_EMULATION message to neighbor
                 Message permission_to_end_msg = create_message(NULL, 0, PERMISSION_TO_END_EMULATION, get_universal_virtual_time(engine));
                 pdes_comm_send(engine->comm, &permission_to_end_msg);
