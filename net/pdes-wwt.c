@@ -19,6 +19,25 @@ PDESWWT *get_singleton_wwt_engine(){
     return singleton_wwt_engine;
 }
 
+/* Drift tolerance between observed virtual time and expected quantum boundary.
+ * Sequential (icount/RR) mode: cpu_budget is capped by deadline-to-next-timer,
+ * so VT lands exactly on every timer — bound is 0.
+ * Parallel (MTTCG/quantum) mode: VT advances by quantum_size per barrier
+ * release, so the round timer can be observed at most one PWQ step past the
+ * boundary — bound is PWQ. */
+static int64_t wwt_drift_bound_ns(void){
+    int64_t pwq = (int64_t)(icount_switch_period ? icount_switch_period : quantum_size);
+    return icount_enabled() ? 0 : pwq;
+}
+
+/* |actual - expected| <= wwt_drift_bound_ns(). Two-sided — for the quantum
+ * boundary sync check where actual must equal expected within tolerance. */
+static bool wwt_within_drift(int64_t actual, int64_t expected){
+    int64_t drift = actual - expected;
+    int64_t bound = wwt_drift_bound_ns();
+    return drift >= -bound && drift <= bound;
+}
+
 int64_t get_current_virtual_for_sync_message(PDESEngine *engine) {
     return get_universal_virtual_time(engine);
 }
@@ -214,12 +233,21 @@ void wwt_recivied_callback(void *opaque, Message *msg){
 
         // Process at schedule or now + 1 which ever is later
         if (wwt_engine->should_sync) {
-            // If should sync, process exactly at timestamp and throw an error if its in the past
+            /* Message timestamp may be up to wwt_drift_bound_ns() in our past:
+             * peer's VT could have landed exactly on the boundary while ours
+             * overshot by one PWQ (parallel mode). Future timestamps are
+             * always fine. */
+            int64_t bound = wwt_drift_bound_ns();
+            if (translated_time + bound < current_virtual_time_translated) {
+                printf("WWT Engine received message with timestamp %lu ns while current virtual time is %lu (drift bound %ld)\n",
+                       translated_time, current_virtual_time_translated, bound);
+                assert(false && "Received message with timestamp more than drift bound in the past while should_sync is enabled");
+            }
+            /* Clamp to current time so the scheduled processing timer can't be
+             * mod'd to a past virtual time, which would fire immediately and
+             * defeat the in-order delivery the WWT protocol relies on. */
             if (translated_time < current_virtual_time_translated) {
-                // Should not happen
-                printf("WWT Engine received message with timestamp %lu ns while current virtual time is %lu\n", translated_time, current_virtual_time_translated);
-                // TODO IMPORTANT address this properly later
-                assert(false && "Received message with timestamp in the past while should_sync is enabled");
+                processing_time = current_virtual_time_translated;
             }
         }else{
             processing_time = (translated_time > current_virtual_time_translated + 1) ? translated_time : current_virtual_time_translated + 1;
@@ -401,28 +429,19 @@ void wwt_sync_check(){
                 int64_t universal_time = get_universal_virtual_time(wwt_engine->engine);
                 int64_t expected_time = get_quantum_time_universal(wwt_engine->current_quantum_round);
                 int64_t drift = universal_time - expected_time;
-                /* Sequential (icount) mode runs one host thread RR over all vCPUs
-                 * and accounts each vCPU's icount in icount_process_data, so VT
-                 * lands exactly on the next-timer deadline — zero drift required.
-                 * Parallel (MTTCG/quantum) mode advances VT by quantum_size per
-                 * barrier release; quanta_sync fires at most one PWQ past the
-                 * MNQ boundary because the round timer is observed at the next
-                 * barrier crossing, so drift is bounded by quantum_size. */
-                int64_t pwq = (int64_t)(icount_switch_period ? icount_switch_period : quantum_size);
-                int64_t drift_bound = icount_enabled() ? 0 : pwq;
+                int64_t bound = wwt_drift_bound_ns();
                 if (drift != 0) {
-                    printf("[DRIFT] round=%lu universal=%ld expected=%ld drift=%ld pwq=%ld bound=%ld mode=%s\n",
-                           wwt_engine->current_quantum_round, universal_time, expected_time, drift, pwq, drift_bound,
+                    printf("[DRIFT] round=%lu universal=%ld expected=%ld drift=%ld bound=%ld mode=%s\n",
+                           wwt_engine->current_quantum_round, universal_time, expected_time, drift, bound,
                            icount_enabled() ? "sequential" : "parallel");
                 }
-                bool validity = (drift >= -drift_bound) && (drift <= drift_bound);
-                if (!validity) {
+                if (!wwt_within_drift(universal_time, expected_time)) {
                     printf("Drift exceeds bound: universal=%ld expected=%ld round=%lu drift=%ld bound=%ld mode=%s\n",
-                           universal_time, expected_time, wwt_engine->current_quantum_round, drift, drift_bound,
+                           universal_time, expected_time, wwt_engine->current_quantum_round, drift, bound,
                            icount_enabled() ? "sequential" : "parallel");
                     printf("current real virtual time is %lu\n", qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
+                    assert(false && "Virtual time drifted past allowed bound (0 in sequential, PWQ in parallel).");
                 }
-                assert(validity && "Virtual time drifted past allowed bound (0 in sequential, PWQ in parallel).");
             }
         }
 
