@@ -5,6 +5,7 @@
 #include "qemu/main-loop.h"
 #include "sysemu/runstate.h"
 #include "sysemu/cpu-timers.h"
+#include "sysemu/quantum.h"
 #include "hw/core/cpu.h"
 
 #ifdef CONFIG_LIBQFLEX
@@ -400,16 +401,28 @@ void wwt_sync_check(){
                 int64_t universal_time = get_universal_virtual_time(wwt_engine->engine);
                 int64_t expected_time = get_quantum_time_universal(wwt_engine->current_quantum_round);
                 int64_t drift = universal_time - expected_time;
-                int64_t drift_abs = drift < 0 ? -drift : drift;
-                /* Sequential mode has bounded, self-correcting drift (sporadic
-                 * single-PWQ overshoots that align back within a few rounds).
-                 * Larger drift indicates a real sync bug. */
-                bool validity = drift_abs < wwt_engine->quantum_ns;
+                /* Sequential (icount) mode runs one host thread RR over all vCPUs
+                 * and accounts each vCPU's icount in icount_process_data, so VT
+                 * lands exactly on the next-timer deadline — zero drift required.
+                 * Parallel (MTTCG/quantum) mode advances VT by quantum_size per
+                 * barrier release; quanta_sync fires at most one PWQ past the
+                 * MNQ boundary because the round timer is observed at the next
+                 * barrier crossing, so drift is bounded by quantum_size. */
+                int64_t pwq = (int64_t)(icount_switch_period ? icount_switch_period : quantum_size);
+                int64_t drift_bound = icount_enabled() ? 0 : pwq;
+                if (drift != 0) {
+                    printf("[DRIFT] round=%lu universal=%ld expected=%ld drift=%ld pwq=%ld bound=%ld mode=%s\n",
+                           wwt_engine->current_quantum_round, universal_time, expected_time, drift, pwq, drift_bound,
+                           icount_enabled() ? "sequential" : "parallel");
+                }
+                bool validity = (drift >= -drift_bound) && (drift <= drift_bound);
                 if (!validity) {
-                    printf("Current universal time %lu is not the same as expected quantum time %lu at round %lu (drift=%ld), this should not happen\n", universal_time, expected_time, wwt_engine->current_quantum_round, drift);
+                    printf("Drift exceeds bound: universal=%ld expected=%ld round=%lu drift=%ld bound=%ld mode=%s\n",
+                           universal_time, expected_time, wwt_engine->current_quantum_round, drift, drift_bound,
+                           icount_enabled() ? "sequential" : "parallel");
                     printf("current real virtual time is %lu\n", qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
                 }
-                assert(validity && "Drift exceeded one MNQ — sync is broken, not just icount overshoot.");
+                assert(validity && "Virtual time drifted past allowed bound (0 in sequential, PWQ in parallel).");
             }
         }
 
@@ -480,16 +493,20 @@ void wwt_sync_check(){
 
 void quanta_sync(PDESWWT *wwt_engine){
     // Sends sync, pauses and waits for others sync, then resumes
-    // printf("WWT: Starting quantum sync at universal virtual time %lu ns.\n", get_universal_virtual_time(wwt_engine->engine));
     wwt_engine->finished_quantum = true;
     // printf("WWT: Sent sync for quantum %lu at virtual time %lu ns and universal time %lu ns.\n", wwt_engine->current_quantum_round, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL), get_universal_virtual_time(wwt_engine->engine));
 
-    /* Drain inbound under the old clock, before flipping pause. */
-    pdes_engine_poll(wwt_engine->engine);
-
+    /* Flip pause FIRST so the main-thread warp path
+     * (icount_start_warp_timer in main_loop_wait) sees engine->paused=true
+     * and returns early — otherwise it can advance qemu_icount_bias by the
+     * deadline to the next virtual timer (e.g. a deferred message timer)
+     * while we're still inside pdes_engine_poll on this thread, producing
+     * drift on the order of one VIRTUAL deadline (~hundreds of µs).
+     * Pause is flag-only; processing inbound messages under pause is safe. */
     if(wwt_engine->should_sync){
         pdes_pause(wwt_engine->engine);
     }
+    pdes_engine_poll(wwt_engine->engine);
     // same using is_waiting_for_quanta as setup, as its the same logic
     int64_t current_time = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
     time_test = current_time;
