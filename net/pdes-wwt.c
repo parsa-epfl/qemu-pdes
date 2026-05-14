@@ -395,19 +395,21 @@ void wwt_sync_check(){
         // TODO Add race condition lock so double checkpoint never happens (reason we double check needs_to_checkpoint)
         bool monitor_virtual_time_drift = wwt_engine->should_sync && (!wwt_engine->engine->skip_boundry_check_after_checkpoint);
         wwt_engine->engine->skip_boundry_check_after_checkpoint = false;
-        monitor_virtual_time_drift = false; // disabled for now TODO add it back in and also fix the problem with checkpointing in non parallel mode
         if (monitor_virtual_time_drift){
             if (wwt_engine->current_quantum_round > 4){
                 int64_t universal_time = get_universal_virtual_time(wwt_engine->engine);
-                // TODO check why this went to -2
                 int64_t expected_time = get_quantum_time_universal(wwt_engine->current_quantum_round);
-                // IMPORTANT TODO fix this
-                bool validity = universal_time == expected_time;
+                int64_t drift = universal_time - expected_time;
+                int64_t drift_abs = drift < 0 ? -drift : drift;
+                /* Sequential mode has bounded, self-correcting drift (sporadic
+                 * single-PWQ overshoots that align back within a few rounds).
+                 * Larger drift indicates a real sync bug. */
+                bool validity = drift_abs < wwt_engine->quantum_ns;
                 if (!validity) {
-                    printf("Current universal time %lu is not the same as expected quantum time %lu at round %lu, this should not happen\n", universal_time, expected_time, wwt_engine->current_quantum_round);
+                    printf("Current universal time %lu is not the same as expected quantum time %lu at round %lu (drift=%ld), this should not happen\n", universal_time, expected_time, wwt_engine->current_quantum_round, drift);
                     printf("current real virtual time is %lu\n", qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
                 }
-                assert(validity && "Current universal time should be equal to the quantum time at the end of quanta_sync, if this assertion fails it means that the host time poll of the underlying engine is causing issues with the timing of the quanta sync, needs to be fixed for better sync performance");
+                assert(validity && "Drift exceeded one MNQ — sync is broken, not just icount overshoot.");
             }
         }
 
@@ -482,6 +484,9 @@ void quanta_sync(PDESWWT *wwt_engine){
     wwt_engine->finished_quantum = true;
     // printf("WWT: Sent sync for quantum %lu at virtual time %lu ns and universal time %lu ns.\n", wwt_engine->current_quantum_round, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL), get_universal_virtual_time(wwt_engine->engine));
 
+    /* Drain inbound under the old clock, before flipping pause. */
+    pdes_engine_poll(wwt_engine->engine);
+
     if(wwt_engine->should_sync){
         pdes_pause(wwt_engine->engine);
     }
@@ -511,7 +516,6 @@ void quanta_sync(PDESWWT *wwt_engine){
 
     // TODO DOCUMENT THIS MORE: for any operation between nodes that can have potential race conditions, it should be done after pause (to prevent race in node) but before send synnc (to prevent race in the other node)
     // TODO add a lock to engine and everything that needs it. notify neighbor is a good example
-    pdes_engine_poll(wwt_engine->engine);
 
 
 

@@ -322,32 +322,11 @@ void schedule_poll(void *opaque){
     timer_mod(engine->msg_rec_poll_timer, qemu_clock_get_ns(QEMU_CLOCK_HOST)+5000000);
 }
 
-void pdes_pause_bh(void *opaque){
-    PDESEngine *engine = opaque;
-
-    vm_stop(RUN_STATE_PAUSED);
-    // Remove the bottom half
-    qemu_bh_delete(engine->pause_bh);
-    engine->pause_bh = NULL;
-}
-#ifndef CONFIG_LIBQFLEX
-// TODO this relies on being on main thread always, add some safeguards for this
-CPUState *paused_cpu = NULL;
-#endif
+/* Flag-only cooperative pause: never stop vCPU threads here (we're on a
+ * virtual-time timer; vm_stop would freeze the recovery timer). PWQ-side
+ * gates in dynamic_barrier.c (MTTCG) and tcg-accel-ops-rr.c (RR) read this. */
 void pdes_pause(void *opaque){
     PDESEngine *engine = opaque;
-
-
-    // Create bh
-    // Make sure bh is empty
-    // assert(engine->pause_bh == NULL && "Pause BH is not NULL when trying to pause, this should not happen");
-    // engine->pause_bh = qemu_bh_new(pdes_pause_bh, engine);
-    // qemu_bh_schedule(engine->pause_bh);
-
-    // qemu_system_vmstop_request_prepare();
-    // qemu_system_vmstop_request(RUN_STATE_PAUSED);
-
-
     engine->paused = true;
 #ifdef CONFIG_LIBQFLEX
     if (flexus_api.pause != NULL){
@@ -356,39 +335,11 @@ void pdes_pause(void *opaque){
         assert(false && "Flexus resume API is not implemented, but stop API is implemented, this should not happen as both should be implemented together");
     }
 #endif
-
-    assert(engine->pause_bh == NULL);
-    engine->pause_bh = qemu_bh_new(pdes_pause_bh, engine);
-    qemu_bh_schedule(engine->pause_bh);
-
-#ifndef CONFIG_LIBQFLEX
-    if (current_cpu != NULL){
-        paused_cpu = current_cpu;
-        current_cpu->stop = true;
-        // cpu_exit(current_cpu);
-    }
-#endif
-
-
-    return;
 }
 
 
 void pdes_play(void *opaque){
-    // TODO add doc where this can be called from (not virt)
     PDESEngine *engine = opaque;
-    // Create bh
-    // Make sure bh is empty
-    // assert(engine->pause_bh == NULL && "Pause BH is not NULL when trying to play, this should not happen");
-    // engine->pause_bh = qemu_bh_new(play_bh, engine);
-    // qemu_bh_schedule(engine->pause_bh);
-#ifndef CONFIG_LIBQFLEX
-    if (paused_cpu != NULL){
-        paused_cpu->stop = false;
-        paused_cpu = NULL;
-    }
-#endif
-    vm_start();
 #ifdef CONFIG_LIBQFLEX
     if (flexus_api.resume != NULL){
         flexus_api.resume();
@@ -397,7 +348,6 @@ void pdes_play(void *opaque){
     }
 #endif
     engine->paused = false;
-    return;
 }
 
 
