@@ -5,11 +5,12 @@
 #include "qemu/main-loop.h"
 #include "sysemu/runstate.h"
 #include "sysemu/cpu-timers.h"
-#include "sysemu/quantum.h"
 #include "hw/core/cpu.h"
 
 #ifdef CONFIG_LIBQFLEX
 #include "middleware/libqflex/libqflex-legacy-api.h"
+#else
+#include "sysemu/quantum.h"
 #endif
 
 extern PDESWWT *singleton_wwt_engine = NULL;
@@ -24,10 +25,15 @@ PDESWWT *get_singleton_wwt_engine(){
  * so VT lands exactly on every timer — bound is 0.
  * Parallel (MTTCG/quantum) mode: VT advances by quantum_size per barrier
  * release, so the round timer can be observed at most one PWQ step past the
- * boundary — bound is PWQ. */
+ * boundary — bound is PWQ.
+ * Timing build (qemu/): Flexus tick drives VT, no PWQ — bound is 0. */
 static int64_t wwt_drift_bound_ns(void){
+#ifdef CONFIG_LIBQFLEX
+    return 0;
+#else
     int64_t pwq = (int64_t)(icount_switch_period ? icount_switch_period : quantum_size);
     return icount_enabled() ? 0 : pwq;
+#endif
 }
 
 /* |actual - expected| <= wwt_drift_bound_ns(). Two-sided — for the quantum
