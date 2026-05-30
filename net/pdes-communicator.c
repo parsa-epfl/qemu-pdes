@@ -121,6 +121,9 @@ PDESCommunicator *pdes_comm_create(const char *shm_send_name,
 
 Message create_message(const uint8_t *data, size_t len, uint8_t type, uint64_t ts_ns)
 {
+    assert(len <= MAX_MSG_SIZE &&
+           "PDES: packet exceeds MAX_MSG_SIZE — bump it in pdes-communicator.h "
+           "or disable TSO/GSO in the guest (ethtool -K <iface> tso off gso off)");
     Message msg = {0};
     msg.ts_ns = ts_ns;
     msg.len   = (uint32_t)len;

@@ -6,7 +6,7 @@
 
 typedef struct PDESCommunicator PDESCommunicator;
 
-#define MAX_MSG_SIZE 2048
+#define MAX_MSG_SIZE 65536
 #define RING_SIZE    8192
 
 #define MSG_TYPE_NORMAL 0
