@@ -107,9 +107,14 @@ PDESWWT *pdes_engine_wwt_create(
 
     singleton_wwt_engine = wwt;
 
-    if (wwt->should_sync){
-        icount_set_sleep(false);
-    }
+    /* Disable icount sleep unconditionally — PDES message delivery uses
+     * QEMU_CLOCK_VIRTUAL timers (see wwt_recivied_callback) regardless of
+     * sync mode. Under sync=false with the default icount_sleep=true, the
+     * main loop can sleep through quiet windows and never advance virtual
+     * time to the delivery deadline, so queued messages sit forever and
+     * the wire looks dead (0% ping reception). Under sync=true this was
+     * already in place; just need it on too when sync=false. */
+    icount_set_sleep(false);
 
 
     return wwt;
