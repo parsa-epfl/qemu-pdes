@@ -20,7 +20,9 @@ PDESWWT *get_singleton_wwt_engine(){
     return singleton_wwt_engine;
 }
 
-/* Drift tolerance between observed virtual time and expected quantum boundary.
+/* Boundary-landing tolerance: OUR OWN VT vs OUR expected quantum boundary (a self
+ * check — see wwt_within_drift). This is NOT the cross-node message-skew bound below;
+ * keep the two separate.
  * Sequential (icount/RR) mode: cpu_budget is capped by deadline-to-next-timer,
  * so VT lands exactly on every timer — bound is 0.
  * Parallel (MTTCG/quantum) mode: VT advances by quantum_size per barrier
@@ -34,6 +36,16 @@ static int64_t wwt_drift_bound_ns(void){
     int64_t pwq = (int64_t)(icount_switch_period ? icount_switch_period : quantum_size);
     return icount_enabled() ? 0 : pwq;
 #endif
+}
+
+/* Cross-node message-skew tolerance: how far behind OUR VT a PEER's packet timestamp
+ * may legitimately be. Synced peers resync only once per multi-node quantum, so between
+ * syncs a peer can be up to one quantum behind us — in EVERY build (timing included).
+ * Distinct from wwt_drift_bound_ns() (the boundary-landing self bound, legitimately 0 in
+ * the timing build); do not merge the two. Sourced from the engine's own sync period so
+ * it can never diverge from the quantum the engine actually syncs on. */
+static int64_t wwt_msg_skew_bound_ns(PDESWWT *wwt){
+    return wwt->quantum_ns;
 }
 
 /* |actual - expected| <= wwt_drift_bound_ns(). Two-sided — for the quantum
@@ -244,15 +256,16 @@ void wwt_recivied_callback(void *opaque, Message *msg){
 
         // Process at schedule or now + 1 which ever is later
         if (wwt_engine->should_sync) {
-            /* Message timestamp may be up to wwt_drift_bound_ns() in our past:
-             * peer's VT could have landed exactly on the boundary while ours
-             * overshot by one PWQ (parallel mode). Future timestamps are
-             * always fine. */
-            int64_t bound = wwt_drift_bound_ns();
+            /* A peer's packet may be up to one multi-node quantum behind our VT: synced
+             * peers only resync once per quantum, so between syncs the peer can lag us by
+             * a quantum. Use the message-skew bound (NOT wwt_drift_bound_ns(), which is the
+             * boundary-landing self bound — 0 in the timing build). Future timestamps are
+             * always fine; the clamp below delivers a slightly-past packet in order. */
+            int64_t bound = wwt_msg_skew_bound_ns(wwt_engine);
             if (translated_time + bound < current_virtual_time_translated) {
-                printf("WWT Engine received message with timestamp %lu ns while current virtual time is %lu (drift bound %ld)\n",
+                printf("WWT Engine received message with timestamp %lu ns while current virtual time is %lu (skew bound %ld)\n",
                        translated_time, current_virtual_time_translated, bound);
-                assert(false && "Received message with timestamp more than drift bound in the past while should_sync is enabled");
+                assert(false && "Received message with timestamp more than one quantum in the past while should_sync is enabled");
             }
             /* Clamp to current time so the scheduled processing timer can't be
              * mod'd to a past virtual time, which would fire immediately and
@@ -514,7 +527,7 @@ void wwt_sync_check(){
         int64_t next_quantum_time_local = next_quantum_time + wwt_engine->engine->first_sync_virtual_time;
         timer_mod(wwt_engine->quantum_timer, next_quantum_time_local);
         // call play to resume
-        // printf("===================WWT: Finished quantum %lu at virtual time %lu ns and universal time %lu ns.===================\n", wwt_engine->current_quantum_round - 1, current_time, get_universal_virtual_time(wwt_engine->engine));
+        printf("===================WWT: Finished quantum %lu at virtual time %lu ns and universal time %lu ns.===================\n", wwt_engine->current_quantum_round - 1, current_time, get_universal_virtual_time(wwt_engine->engine));
         if(wwt_engine->should_sync){
             pdes_play(wwt_engine->engine);
         }
@@ -566,7 +579,7 @@ void quanta_sync(PDESWWT *wwt_engine){
 
 
 
-    // printf("===================WWT: going to pause for quantum %lu at virtual time %lu ns and universal time %lu ns.===================\n", wwt_engine->current_quantum_round, current_time, get_universal_virtual_time(wwt_engine->engine));
+    printf("===================WWT: going to pause for quantum %lu at virtual time %lu ns and universal time %lu ns.===================\n", wwt_engine->current_quantum_round, current_time, get_universal_virtual_time(wwt_engine->engine));
 
     // Need to send notify neighbors before sync, or else before here and notify the neighbor might move to the next quantum
     if(wwt_engine->engine->needs_to_checkpoint && !wwt_engine->engine->notified_neighbors){
