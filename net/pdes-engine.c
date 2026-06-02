@@ -52,6 +52,9 @@ PDESEngine *pdes_engine_create(
     engine->recv_cb = cb;
     engine->recv_opaque = opaque;
     engine->has_first_sync = false;
+    engine->sent_first_sync = false;
+    engine->received_first_sync = false;
+    engine->deferred_normal = g_queue_new();
     engine->waiting_for_quanta = false;
     engine->pair_has_finished = false;
     engine->base_diff = 0;

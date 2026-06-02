@@ -26,7 +26,10 @@ struct PDESEngine {
     QEMUTimer *msg_rec_poll_timer;
     QEMUTimer *sync_poll_timer;
     QEMUTimer *setup_poll_timer;
-    bool has_first_sync;
+    bool has_first_sync;        /* gate: open once our first sync is sent AND peer's received */
+    bool sent_first_sync;       /* our setup_wwt has set first_sync_virtual_time and sent sync */
+    bool received_first_sync;   /* we've received the peer's first sync */
+    GQueue *deferred_normal;    /* NORMAL msgs parked while the gate is shut (Message* copies) */
     bool pair_has_finished;
 
     // Specific to QEMU implications of blocking event queu in case of pause on device and icount TODO generalize

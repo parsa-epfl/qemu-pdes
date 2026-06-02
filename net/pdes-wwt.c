@@ -56,6 +56,22 @@ static bool wwt_within_drift(int64_t actual, int64_t expected){
     return drift >= -bound && drift <= bound;
 }
 
+/* Open the NORMAL-message gate once BOTH our first sync is set up (sent_first_sync, so
+ * first_sync_virtual_time is real) AND the peer's first sync has arrived
+ * (received_first_sync). Replays any NORMAL packets parked while the gate was shut — they
+ * now translate into the correct frame. SYNC is never gated, so this can't deadlock. */
+static void wwt_open_first_sync_gate(PDESWWT *wwt_engine){
+    PDESEngine *engine = wwt_engine->engine;
+    if (engine->has_first_sync) return;
+    if (!(engine->sent_first_sync && engine->received_first_sync)) return;
+    engine->has_first_sync = true;
+    Message *m;
+    while ((m = (Message *)g_queue_pop_head(engine->deferred_normal)) != NULL){
+        wwt_recivied_callback(wwt_engine, m);   /* gate now open -> processed normally */
+        g_free(m);
+    }
+}
+
 int64_t get_current_virtual_for_sync_message(PDESEngine *engine) {
     return get_universal_virtual_time(engine);
 }
@@ -149,6 +165,14 @@ void setup_wwt(PDESWWT *wwt_engine){
     wwt_engine->engine->first_sync_virtual_time = current_time;
     printf("WWT: Setup called, setting first sync virtual time to %lu ns.\n", current_time);
 
+    /* Our virtual-time base (first_sync_virtual_time) is now real. Mark it, and open the
+     * NORMAL-message gate if the peer's first sync already arrived. Until the gate is open,
+     * NORMAL packets are parked (see wwt_recivied_callback) so none is time-compared while
+     * first_sync_virtual_time is still its create-time 0 — which is what produced the
+     * "message in the past" aborts. */
+    wwt_engine->engine->sent_first_sync = true;
+    wwt_open_first_sync_gate(wwt_engine);
+
     PDESWWT *wwt = wwt_engine;
 
     // We are always doing barrier in case there are other ops there, but if sync is off we don't wait for neighbors to finish
@@ -176,9 +200,10 @@ void setup_wwt(PDESWWT *wwt_engine){
     // TODO address the bug that may be caused without sync (as you can see multiple sync messages at once)
     wwt_engine->number_of_neighbors_finished = 0;
     printf("WWT: Setup starting at virtual time %lu ns and universal time off: %lu ns.\n", current_time, get_universal_virtual_time(wwt_engine->engine));
-    // TODO increasing this for when resource contention can happen when running things in parallel, needs a better cleaner solution
-    // 500ms one-shot defers the receive poll past first sync; without it a packet that arrives before our first sync goes out can be processed early and break time-bias setup
-    timer_mod(wwt_engine->engine->msg_rec_poll_timer, qemu_clock_get_ns(QEMU_CLOCK_HOST)+500000000); // 500 milliseconds, just the first time
+    // Kick the receive poll now; the first-sync gate (not a timing delay) is what keeps
+    // NORMAL packets from being processed before our base is set, so the old 500ms one-shot
+    // deferral is no longer needed.
+    timer_mod(wwt_engine->engine->msg_rec_poll_timer, qemu_clock_get_ns(QEMU_CLOCK_HOST));
 }
 
 void send_sync(PDESWWT *wwt_engine){
@@ -213,6 +238,11 @@ void wwt_recivied_callback(void *opaque, Message *msg){
     if(msg->type == MSG_TYPE_SYNC){
         // Received sync message from neighbor
 
+        /* SYNC is never gated. Record the peer's first sync and open the NORMAL gate when
+         * both sides' first syncs are in (replays any parked NORMAL packets). */
+        wwt_engine->engine->received_first_sync = true;
+        wwt_open_first_sync_gate(wwt_engine);
+
         // assert that time difference between nodes can not be more than quanta
         // TODO removed due to the host time poll of underlying engine causing issues, needs to be fixed later, should be ok for later syncs still
         // if (abs(translated_time - current_virtual_time) > wwt_engine->quantum_ns) {
@@ -244,6 +274,18 @@ void wwt_recivied_callback(void *opaque, Message *msg){
         // printf("WWT: Sync received for round %lu (count now %d)\n", msg_round, sync_count_get(wwt_engine->sync_counts, msg_round));
 
     } else if (msg->type == MSG_TYPE_NORMAL){
+        /* Gate: until the first-sync handshake establishes our time base, park NORMAL
+         * packets instead of time-comparing them — otherwise first_sync_virtual_time is
+         * still its create-time 0 and the raw inter-node VT gap reads as a huge "in the
+         * past". Only when syncing (with sync off there's no base to wait for and no skew
+         * check, and the gate would never open). Parked packets are replayed in order by
+         * wwt_open_first_sync_gate once the gate opens. */
+        if (wwt_engine->should_sync && !wwt_engine->engine->has_first_sync) {
+            Message *copy = g_new(Message, 1);
+            *copy = *msg;
+            g_queue_push_tail(wwt_engine->engine->deferred_normal, copy);
+            return;
+        }
         // Normal message, pass to final callback
         // Use message timestamp to process it later at correct virtual time
         MessageReceiveContext *ctx = g_new0(MessageReceiveContext, 1);
