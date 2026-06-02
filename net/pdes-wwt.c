@@ -569,7 +569,7 @@ void wwt_sync_check(){
         int64_t next_quantum_time_local = next_quantum_time + wwt_engine->engine->first_sync_virtual_time;
         timer_mod(wwt_engine->quantum_timer, next_quantum_time_local);
         // call play to resume
-        printf("===================WWT: Finished quantum %lu at virtual time %lu ns and universal time %lu ns.===================\n", wwt_engine->current_quantum_round - 1, current_time, get_universal_virtual_time(wwt_engine->engine));
+        // printf("===================WWT: Finished quantum %lu at virtual time %lu ns and universal time %lu ns.===================\n", wwt_engine->current_quantum_round - 1, current_time, get_universal_virtual_time(wwt_engine->engine));
         if(wwt_engine->should_sync){
             pdes_play(wwt_engine->engine);
         }
@@ -621,7 +621,7 @@ void quanta_sync(PDESWWT *wwt_engine){
 
 
 
-    printf("===================WWT: going to pause for quantum %lu at virtual time %lu ns and universal time %lu ns.===================\n", wwt_engine->current_quantum_round, current_time, get_universal_virtual_time(wwt_engine->engine));
+    // printf("===================WWT: going to pause for quantum %lu at virtual time %lu ns and universal time %lu ns.===================\n", wwt_engine->current_quantum_round, current_time, get_universal_virtual_time(wwt_engine->engine));
 
     // Need to send notify neighbors before sync, or else before here and notify the neighbor might move to the next quantum
     if(wwt_engine->engine->needs_to_checkpoint && !wwt_engine->engine->notified_neighbors){
