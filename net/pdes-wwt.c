@@ -216,7 +216,10 @@ void send_sync(PDESWWT *wwt_engine){
     // Checkpoint REQUEST rides the barrier message: the round we flag is the round both nodes
     // checkpoint at. A peer cannot cross this round without first consuming this sync, so it learns the
     // round before it can pass it — no announcement lag. notified_neighbors is the "already flagged" latch.
-    if (engine->needs_to_checkpoint && !engine->notified_neighbors){
+    // MASTER-ONLY: only the master announces. In FW every node's save_snapshot sets needs_to_checkpoint
+    // locally, so a peer would otherwise self-announce, set notified_neighbors, and then refuse to adopt
+    // the master's request — keeping its own (non-QPDES) name + round, which validate_checkpoint skips.
+    if (engine->master && engine->needs_to_checkpoint && !engine->notified_neighbors){
         ctrl |= CTRL_CKP_REQUEST;
         engine->notified_neighbors = true;
         engine->checkpoint_quantum_round = round;     // commit: checkpoint at this round
