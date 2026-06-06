@@ -117,8 +117,7 @@ void _send_end_if_handshake_complete(PDESEngine *engine){
 }
 
 void notify_neighbours_of_end(PDESEngine *engine){
-    // Just queue END if the handshake is complete; _send_end_if_handshake_complete is already
-    // idempotent (end_message_sent), so no separate latch is needed.
+    // Queue END if the handshake is complete; idempotent via end_message_sent.
     _send_end_if_handshake_complete(engine);
 }
 // TODO clean this up, destroying needs clean up
