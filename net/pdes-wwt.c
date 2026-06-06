@@ -13,6 +13,24 @@
 #include "sysemu/quantum.h"
 #endif
 
+// Extra-verbose PDES logging, gated on VERBOSE_PDES=1|true. Each line is prefixed with HOST wall-clock
+// time (docker/machine, not qemu virtual time). For now only the quantum start/end lines use it.
+// Off-path cost is two int comparisons on a cached static (no function call, no formatting); getenv
+// runs once. Only the quantum-frequency hot path needs to stay cheap, so the flag is inlined here.
+static int pdes_verbose_cached = -1;   // -1 = unknown, 0 = off, 1 = on
+static const char *pdes_host_ts(char *buf, size_t n){
+    struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts);
+    struct tm tm; localtime_r(&ts.tv_sec, &tm);
+    size_t off = strftime(buf, n, "%H:%M:%S", &tm);
+    snprintf(buf + off, n - off, ".%03ld", ts.tv_nsec / 1000000);
+    return buf;
+}
+#define PDES_VLOG(fmt, ...) do { \
+    if (pdes_verbose_cached < 0){ const char *_e = getenv("VERBOSE_PDES"); \
+        pdes_verbose_cached = (_e && (!strcmp(_e, "1") || !strcasecmp(_e, "true"))) ? 1 : 0; } \
+    if (pdes_verbose_cached){ char _b[32]; printf("[%s] " fmt, pdes_host_ts(_b, sizeof _b), ##__VA_ARGS__); } \
+} while (0)
+
 extern PDESWWT *singleton_wwt_engine = NULL;
 
 
@@ -560,7 +578,7 @@ void wwt_sync_check(){
         int64_t next_quantum_time_local = next_quantum_time + wwt_engine->engine->first_sync_virtual_time;
         timer_mod(wwt_engine->quantum_timer, next_quantum_time_local);
         // call play to resume
-        printf("===================WWT: Finished quantum %lu at virtual time %lu ns and universal time %lu ns.===================\n", wwt_engine->current_quantum_round - 1, current_time, get_universal_virtual_time(wwt_engine->engine));
+        PDES_VLOG("WWT: Finished quantum %lu at virtual time %lu ns and universal time %lu ns.\n", wwt_engine->current_quantum_round - 1, current_time, get_universal_virtual_time(wwt_engine->engine));
         if(wwt_engine->should_sync){
             pdes_play(wwt_engine->engine);
         }
@@ -612,7 +630,7 @@ void quanta_sync(PDESWWT *wwt_engine){
 
 
 
-    printf("===================WWT: going to pause for quantum %lu at virtual time %lu ns and universal time %lu ns.===================\n", wwt_engine->current_quantum_round, current_time, get_universal_virtual_time(wwt_engine->engine));
+    PDES_VLOG("WWT: going to pause for quantum %lu at virtual time %lu ns and universal time %lu ns.\n", wwt_engine->current_quantum_round, current_time, get_universal_virtual_time(wwt_engine->engine));
 
     // All control signals (checkpoint + exit handshake) ride the sync, so we emit one every quantum
     // even when sync is off — otherwise an off node could never deliver a checkpoint/exit signal.
