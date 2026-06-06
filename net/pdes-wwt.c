@@ -404,43 +404,6 @@ int64_t get_quantum_time_local(int64_t quantum_round){
 
 
 
-int notify_neighbors_for_drain(PDESEngine *engine, char * snapshot_name, SnapshotFormat format){
-    if(!engine->needs_to_checkpoint){
-        assert(false && "Should not be notifying neighbors for drain if we don't need to checkpoint");
-    }
-    if (engine->notified_neighbors){
-        return 0;
-    }
-    engine->notified_neighbors = true;
-    printf("Notifying neighbors for drain with snapshot name: %s and format: %d\n", snapshot_name, format);
-    uint8_t snapshot_name_data[1006];
-    int n = snprintf((char *)snapshot_name_data, sizeof(snapshot_name_data),
-                    "QPDES%s", snapshot_name ? snapshot_name : "");
-    if (n < 0) {
-        // encoding/format error
-        return -1;
-    }
-
-    if (n >= sizeof(snapshot_name_data)) {
-        // Output was truncated, handle the error
-        fprintf(stderr, "Snapshot name is too long and was truncated\n");
-        return -1;
-    }
-    snprintf((char *)snapshot_name_data, sizeof(snapshot_name_data), "QPDES%s", snapshot_name);
-    // Validate this formatting of string, for both send and receive
-    memcpy(snapshot_name_data + n, &format, sizeof(SnapshotFormat));
-    size_t total_len = (size_t)n + sizeof(SnapshotFormat);
-
-    // Add in quantum round too:
-    // TODO this is specific to wwt, need to generalize
-    uint64_t quantum_round = engine->checkpoint_quantum_round;
-    memcpy(snapshot_name_data + total_len, &quantum_round, sizeof(quantum_round));
-    total_len += sizeof(quantum_round);
-
-    Message drain_start_msg = create_message(snapshot_name_data, total_len, DRAIN_START, get_universal_virtual_time(engine));
-    pdes_comm_send(engine->comm, &drain_start_msg);
-    printf("notified neighbours with drain start message with snapshot name: %s with size %zu and sent it\n", snapshot_name_data, (size_t)n);
-}
 
 bool sync_checkpoint_check(){
     PDESWWT *wwt_engine = get_singleton_wwt_engine();

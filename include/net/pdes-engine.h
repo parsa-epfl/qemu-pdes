@@ -51,9 +51,7 @@ struct PDESEngine {
     int64_t base_time_diff;
 
     // Checkpoint specific
-    int neighbour_drained;
     QEMUTimer *drain_poll_timer;
-    bool checkpoint_in_progress;
     QEMUTimer *checkpoint_initiate_timer;
     QEMUBH *checkpoint_bh;
 
@@ -80,7 +78,6 @@ struct PDESEngine {
     bool skip_boundry_check_after_checkpoint;
 
     // exit changes
-    bool notified_neighbors_for_exit;
     int ready_to_exit_neighbors;
     bool permitted_to_exit;
     bool ready_to_exit;
@@ -195,7 +192,6 @@ void process_message_at_virtual_time(MessageReceiveContext *opaque);
 
 int64_t get_universal_virtual_time(PDESEngine *engine);
 PDESWWT *get_singleton_wwt_engine();
-int send_initiate_checkpoint_message(PDESEngine *engine);
 void sync_count_increment(GHashTable *table, uint64_t round);
 int sync_count_get(GHashTable *table, uint64_t round);
 void finish_initiate_checkpoint(PDESEngine *engine);

@@ -65,8 +65,6 @@ PDESEngine *pdes_engine_create(
     engine->first_sync_virtual_time = first_sync_virtual_time;
     engine->caclulated_time_diff = false;
     engine->base_time_diff = 0;
-    engine->neighbour_drained = 0;
-    engine->checkpoint_in_progress = false;
 
     engine->master = master;
     engine->init_flag = 0;
@@ -74,7 +72,6 @@ PDESEngine *pdes_engine_create(
     engine->pause_bh = NULL;
     engine->needs_to_checkpoint = false;
     engine->notified_neighbors = false;
-    engine->notified_neighbors_for_exit = false;
     engine->boundry_checkpoint_bh = NULL;
     engine->skip_boundry_check_after_checkpoint = false;
     engine->ready_to_exit_neighbors = 0;
@@ -120,7 +117,8 @@ void _send_end_if_handshake_complete(PDESEngine *engine){
 }
 
 void notify_neighbours_of_end(PDESEngine *engine){
-    if(qatomic_xchg(&engine->notified_neighbors_for_exit, true)) return;
+    // Just queue END if the handshake is complete; _send_end_if_handshake_complete is already
+    // idempotent (end_message_sent), so no separate latch is needed.
     _send_end_if_handshake_complete(engine);
 }
 // TODO clean this up, destroying needs clean up
@@ -237,98 +235,6 @@ void process_message(PDESEngine *engine, Message *msg) {
         }
     }
 
-    // TODO both drain start and and end are based on just one neighbor for now, need to generalize later
-    if(msg->type == INTENT_TO_END_EMULATION){
-        if (engine->master){
-            printf("Received intent to end emulation message from neighbor, permitting neighbor to exit and sending permission message back.\n");
-            qatomic_inc(&engine->ready_to_exit_neighbors);
-        }
-    }
-    if (msg->type == PERMISSION_TO_END_EMULATION){
-        printf("Received permission to end emulation; setting permitted_to_exit.\n");
-        qatomic_set(&engine->permitted_to_exit, true);
-        _send_end_if_handshake_complete(engine);
-    }
-    if (msg->type == END_OF_EMULATION){
-        printf("Received END_OF_EMULATION; pair_has_finished.\n");
-        /* Protocol invariant: peer only sends END after the INTENT/PERMISSION
-         * handshake completes. That means our own permitted_to_exit is
-         * already set — master flipped it when granting permission (before
-         * _send_end_if_handshake_complete fires); follower flipped it on
-         * the PERMISSION arm above, which the FIFO shm ring delivers before
-         * the master's END. If this assert fires, the END handshake is
-         * broken upstream — peer exited prematurely. */
-        assert(qatomic_read(&engine->permitted_to_exit)
-               && "process_message: got END_OF_EMULATION before our "
-                  "permitted_to_exit was set. Peer cannot have sent END "
-                  "yet per the INTENT/PERMISSION/END protocol.");
-        qatomic_set(&engine->pair_has_finished, true);
-    }
-    if (msg->type==DRAIN_START){
-        printf("PDES Engine received drain end message, marking drained as true.\n");
-        engine->checkpoint_in_progress = true;
-
-        if (!engine->master){
-            printf("PDES Engine initiating systemic snapshot save after drain.\n");
-            // This is not master so we need to savesnapshot immidiately
-            // TODO change this so the message includes snapshot name
-            // TODO : Ugly solution for now to avoid deadlock:  create a host time timer, call this later, call it immidiately after this
-            // TODO We will get stuck thanks to quanta, need to generalize later
-            Message *msg_copy = g_new(Message, 1);
-            *msg_copy = *msg;
-
-            engine->needs_to_checkpoint = true;
-
-            // TODO verify new snapshot name formatting and parsing, for both send and receive
-            // TODO just turn this into a struct message
-            size_t name_len = msg->len - sizeof(SnapshotFormat) - sizeof(uint64_t);
-            memcpy(engine->checkpoint_name, msg->data, name_len);
-            engine->checkpoint_name[name_len] = '\0'; // null-terminate if needed
-
-            SnapshotFormat format;
-            memcpy(&format, msg->data + name_len, sizeof(SnapshotFormat));
-
-            // read quantum round too, for later use if needed
-            uint64_t quantum_round = 0;
-            if (msg->len >= sizeof(SnapshotFormat) + sizeof(uint64_t)) {
-                memcpy(&quantum_round, msg->data + name_len + sizeof(SnapshotFormat),sizeof(uint64_t));
-            }
-
-            engine->checkpoint_format = format;
-            engine->checkpoint_quantum_round = quantum_round;
-
-            printf("Parsed checkpoint initiation message, snapshot name: %s, format: %d, quantum round: %lu\n", engine->checkpoint_name, format, quantum_round);
-            // printf("[CKPT] peer adopted ckpt_round=%lu while current_round=%lu (needs_to_checkpoint set)\n", quantum_round, get_singleton_wwt_engine()->current_quantum_round);
-
-
-
-
-
-        }else{
-            // This variable is only used for master, TODO maybe move this
-            engine->neighbour_drained += 1;
-        }
-    }else if (msg->type==DRAIN_END){
-        printf("PDES Engine received drain end message, marking checkpoint as completed.\n");
-        if (!engine->master){
-            // This is not master, we are letting known we can move on with simulation
-            engine->checkpoint_in_progress = false;
-        }
-    }else if(msg->type==CHECKPOINT_INIT_STEP){
-        printf("PDES Engine received checkpoint initiation message, initiating checkpoint.\n");
-        engine->init_flag++;
-        // TODO expand this into multiple nodes
-        if (engine->master){
-            printf("This is a master, checking if we can initiate checkpoint immediately or need to wait for next initiation message.\n");
-            if (engine->init_flag == 1 && engine->master_init){
-                set_checkpoint_values_for_master("init_warmed");
-            }else{
-                printf("Master received checkpoint initiation message, but master init flag is not set, marking master as ready and waiting for next checkpoint initiation message.\n");
-            }
-        }else{
-            printf("Not a master, just returning after receiving checkpoint initiation message.\n");
-        }
-    }
 }
 
 void pdes_engine_poll(void *opaque) {
@@ -390,38 +296,19 @@ void pdes_play(void *opaque){
 
 
 
+// TODO: vestigial. With all messages delivered by the quantum barrier and checkpoints landing only at
+// a barrier, nothing is ever in flight across a snapshot — pdes_inflight_add is disabled, so this only
+// writes an empty JSON. Remove pdes_drain + its savevm.c calls + the whole in-flight machinery below.
 int pdes_drain(PDESEngine *engine, char * snapshot_name, SnapshotFormat format) {
 #ifdef CONFIG_LIBQFLEX
     assert(format == SNAPSHOT_FORMAT_EXTERNAL_INCREMENTAL_BASE && "qemu fork: pdes_drain only supports SNAPSHOT_FORMAT_EXTERNAL_INCREMENTAL_BASE");
 #endif
-    if (engine->master){
-        engine->checkpoint_in_progress = true;
-
-
-
-
-
-        Message drain_end_msg = create_message(NULL, 0, DRAIN_END, get_universal_virtual_time(engine));
-        pdes_comm_send(engine->comm, &drain_end_msg);
-        engine->neighbour_drained = 0;
-
-        printf("Everyone has drained and finished checkpointing.\n");
-    }
     pdes_inflight_save_json(snapshot_name);
     return 0;
 }
 
 
 
-int send_initiate_checkpoint_message(PDESEngine *engine){
-    // Create a message for checkpoint initiation, with the time being current virtual time
-
-    // TODO add multi-neighbour support to send for everyone
-    Message checkpoint_init_msg = create_message(NULL, 0, CHECKPOINT_INIT_STEP, get_universal_virtual_time(engine));
-    pdes_comm_send(engine->comm, &checkpoint_init_msg);
-    printf("Sent checkpoint initiation message to neighbor.\n");
-    return 0;
-}
 
 void finish_initiate_checkpoint(PDESEngine *engine){
     printf("========================GOT signal for initiate_checkpoint========================\n");

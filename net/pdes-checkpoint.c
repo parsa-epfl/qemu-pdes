@@ -3,6 +3,9 @@
 #include "qemu/queue.h"
 #include "qemu/timer.h"
 
+// TODO: the in-flight machinery below (pdes_inflight_*) is vestigial — pdes_inflight_add is disabled
+// and nothing is ever in flight across a quantum-aligned checkpoint, so it only ever writes/reads
+// empty JSON. Remove it (and pdes_drain) once confirmed; keep only validate_checkpoint + create_checkpoint_bh.
 typedef struct ScheduledMessage {
     Message msg;
     int64_t scheduled_time_ns;
@@ -242,21 +245,12 @@ bool validate_checkpoint(const char **check_point_name){
                 *check_point_name = name + 5;
                 printf("modified checkpoint name for PDESEngine: %s and continuing with checkpointing.\n", *check_point_name);
                 return true;
-            }else if (name != NULL && strcmp(name, "init_warmed") == 0) {
-                printf("!!!!!!!!!!!!!!!! THIS SHOULD NOT BE HAPPENINGING !!!!!!!!!!!!!!!!\n");
-                return false;
-                // TODO expand this to multiple nodes
-                // This is not the master so it can't initiate it, just let master know we are ready
-                printf("Received drain signal but not master, marking engine as done for init.\n");
-                int res = send_initiate_checkpoint_message(engine);
-                assert (res == 0 && "Failed to send checkpoint initiation message to master");
-                printf("Sent checkpoint initiation message to master successfully, waiting for checkpoint initiation signal.\n");
-                return false;
             }else{
-                // We will skip any checkpointing as master decides when to checkpoint, need to return (caused by pdes)
+                // Not master and not a QPDES-tagged (master-initiated) checkpoint: skip — the master
+                // decides when peers checkpoint, via the CTRL_CKP_REQUEST flag on the sync.
                 printf("Skipping snapshot as not master PDESEngine\n");
                 return false;
-            } 
+            }
         }else{
             // Master
             if (name != NULL && strcmp(name, "init_warmed") == 0){
@@ -298,7 +292,6 @@ void create_checkpoint_bh(bool exit_after){
     }
 
     printf("WWT: Finished waiting for quanta for round %lu, starting checkpoint for this quantum.\n", wwt_engine->current_quantum_round - 1);
-    wwt_engine->engine->checkpoint_in_progress = false;
     printf("WWT: Starting checkpoint for quantum %lu with snapshot name %s and format %d.\n", wwt_engine->current_quantum_round - 1, wwt_engine->engine->checkpoint_name, wwt_engine->engine->checkpoint_format);
     save_snapshot(wwt_engine->engine->checkpoint_name, true, NULL, false, NULL, wwt_engine->engine->checkpoint_format, NULL);
     printf("WWT: Finished checkpoint for quantum %lu, starting next quantum.\n", wwt_engine->current_quantum_round - 1);
