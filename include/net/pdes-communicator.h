@@ -19,6 +19,7 @@ typedef struct PDESCommunicator PDESCommunicator;
 #define END_OF_EMULATION 6
 #define INTENT_TO_END_EMULATION 7
 #define PERMISSION_TO_END_EMULATION 8
+#define CHECKPOINT_DONE 9
 
 typedef struct {
     uint64_t ts_ns;       /* timestamp in nanoseconds */

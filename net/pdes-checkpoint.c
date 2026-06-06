@@ -292,6 +292,8 @@ bool validate_checkpoint(const char **check_point_name){
 void create_checkpoint_bh(bool exit_after){
     PDESWWT *wwt_engine = get_singleton_wwt_engine();
     if (!wwt_engine->engine->needs_to_checkpoint){
+        printf("[CKPT] create_checkpoint_bh fired but needs_to_checkpoint=false, SKIPPING (master=%d round=%lu)\n",
+               wwt_engine->engine->master, wwt_engine->current_quantum_round);
         return;
     }
 
@@ -308,11 +310,27 @@ void create_checkpoint_bh(bool exit_after){
     wwt_engine->engine->boundry_checkpoint_bh = NULL;
     wwt_engine->engine->skip_boundry_check_after_checkpoint = true;
 
-    // TODO make this check more modular (also maybe move verify function to here?)
-    // If checkpoint name is init_warmed, destroy engine and stop simulation
-    if (strcmp(wwt_engine->engine->checkpoint_name, "init_warmed") == 0 && wwt_engine->engine->master){
-        printf("Checkpoint name is init_warmed, destroying engine and stopping simulation.\n");
-        pdes_engine_destroy(wwt_engine->engine);
+    // Terminal init_warmed checkpoint: both nodes saved at the same agreed quantum (master name is
+    // "init_warmed", peer's is "QPDESinit_warmed"). Tell the peer our save is durable AND at which
+    // quantum round, wait for theirs, assert the rounds match, then exit. Symmetric so a faster node
+    // can't exit and peer-kill a slower one mid-save.
+    if (strstr(wwt_engine->engine->checkpoint_name, "init_warmed") != NULL){
+        PDESEngine *engine = wwt_engine->engine;
+        // current_quantum_round is the agreed round R (both halt here, neither advanced); it is the
+        // exact cross-node quantum identifier. Universal time is R*quantum_ns ± PWQ in parallel mode,
+        // so it is logged but NOT asserted on.
+        uint64_t my_round = wwt_engine->current_quantum_round;
+        Message done = create_message((uint8_t *)&my_round, sizeof(my_round), CHECKPOINT_DONE, get_universal_virtual_time(engine));
+        pdes_comm_send(engine->comm, &done);
+        while (!engine->peer_ckpt_done){   /* written only on the main thread (process_message via poll) */
+            pdes_engine_poll(engine);
+            g_usleep(1000);
+        }
+        assert(engine->peer_ckpt_round == my_round &&
+               "init_warmed checkpoint quanta misaligned across nodes");
+        printf("Both nodes checkpointed init_warmed at quantum round %lu (universal time %ld); stopping.\n",
+               my_round, get_universal_virtual_time(engine));
+        pdes_engine_destroy(engine);
     }
     if (exit_after){
         printf("Exiting after checkpointing because exit flag is set.\n");

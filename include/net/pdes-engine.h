@@ -86,6 +86,10 @@ struct PDESEngine {
     bool ready_to_exit;
     bool end_message_sent;
     bool intent_sent;
+
+    // terminal-checkpoint handshake: peer's save is durable and at this quantum round
+    bool peer_ckpt_done;
+    uint64_t peer_ckpt_round;
 };
 
 PDESEngine *pdes_engine_create(

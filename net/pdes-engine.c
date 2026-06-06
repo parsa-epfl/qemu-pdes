@@ -82,6 +82,8 @@ PDESEngine *pdes_engine_create(
     engine->ready_to_exit = false;
     engine->end_message_sent = false;
     engine->intent_sent = false;
+    engine->peer_ckpt_done = false;
+    engine->peer_ckpt_round = 0;
 
 
 
@@ -189,7 +191,9 @@ void set_checkpoint_values_for_master(){
     engine->checkpoint_format = SNAPSHOT_FORMAT_EXTERNAL_INCREMENTAL_BASE;
     // TODO this is specific to wwt, need to generalize later, maybe include this in the message
     PDESWWT *wwt_engine = get_singleton_wwt_engine();
-    engine->checkpoint_quantum_round = wwt_engine->current_quantum_round; // this is specific to wwt, need to generalize later
+    // +2: round must be strictly ahead of BOTH nodes (peer is within ±1 of us) and the DRAIN_START is
+    // FIFO-enqueued before any later sync, so the peer adopts the round before it can cross it.
+    engine->checkpoint_quantum_round = wwt_engine->current_quantum_round + 2; // this is specific to wwt, need to generalize later
     char* snapshot_name = "init_warmed";
     snprintf(engine->checkpoint_name, sizeof(engine->checkpoint_name), "%s", snapshot_name);
     printf("Setting checkpoint values for master, snapshot name: %s, format: %d, quantum round: %lu\n", engine->checkpoint_name, engine->checkpoint_format, engine->checkpoint_quantum_round);
@@ -201,7 +205,7 @@ void process_message(PDESEngine *engine, Message *msg) {
     engine->recv_cb(engine->recv_opaque, msg);
 
 
-    // printf("PDES Engine received message of type %u with timestamp %lu ns and len %u bytes.\n", msg->type, msg->ts_ns, msg->len);
+    printf("PDES Engine received message of type %u with timestamp %lu ns and len %u bytes.\n", msg->type, msg->ts_ns, msg->len);
 
     // TODO both drain start and and end are based on just one neighbor for now, need to generalize later
     if(msg->type == INTENT_TO_END_EMULATION){
@@ -229,6 +233,12 @@ void process_message(PDESEngine *engine, Message *msg) {
                   "permitted_to_exit was set. Peer cannot have sent END "
                   "yet per the INTENT/PERMISSION/END protocol.");
         qatomic_set(&engine->pair_has_finished, true);
+    }
+    if (msg->type == CHECKPOINT_DONE){
+        if (msg->len >= sizeof(uint64_t)){
+            memcpy(&engine->peer_ckpt_round, msg->data, sizeof(uint64_t));
+        }
+        engine->peer_ckpt_done = true;   /* main thread only (process_message via poll) */
     }
     if (msg->type==DRAIN_START){
         printf("PDES Engine received drain end message, marking drained as true.\n");
@@ -264,6 +274,7 @@ void process_message(PDESEngine *engine, Message *msg) {
             engine->checkpoint_quantum_round = quantum_round;
 
             printf("Parsed checkpoint initiation message, snapshot name: %s, format: %d, quantum round: %lu\n", engine->checkpoint_name, format, quantum_round);
+            printf("[CKPT] peer adopted ckpt_round=%lu while current_round=%lu (needs_to_checkpoint set)\n", quantum_round, get_singleton_wwt_engine()->current_quantum_round);
 
 
 
