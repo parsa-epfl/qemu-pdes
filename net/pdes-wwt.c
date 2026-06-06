@@ -207,10 +207,31 @@ void setup_wwt(PDESWWT *wwt_engine){
 }
 
 void send_sync(PDESWWT *wwt_engine){
+    PDESEngine *engine = wwt_engine->engine;
+    uint8_t buf[1006];
     uint64_t round = wwt_engine->current_quantum_round;
-    Message sync_msg = create_message((uint8_t *)&round, sizeof(round), MSG_TYPE_SYNC, get_current_virtual_for_sync_message(wwt_engine->engine));
-    pdes_engine_send(wwt_engine->engine, &sync_msg);
-    printf("WWT: Sent sync message for round %lu at virtual time %lu ns.\n", round, get_universal_virtual_time(wwt_engine->engine));
+    memcpy(buf, &round, sizeof(round));               // [0..8) round
+    size_t len = sizeof(round) + 1;                   // [8] checkpoint flag
+    uint8_t requires_checkpoint = 0;
+    // Piggyback the checkpoint request on the barrier message itself: the round we flag is the round we
+    // (and the peer, on consuming this very sync) checkpoint at. A peer cannot cross this round without
+    // first consuming this sync, so it learns the round before it can pass it — no announcement lag.
+    // notified_neighbors is the "already committed/flagged" latch.
+    if (engine->needs_to_checkpoint && !engine->notified_neighbors){
+        requires_checkpoint = 1;
+        engine->notified_neighbors = true;
+        engine->checkpoint_quantum_round = round;     // commit: checkpoint at this round
+        size_t off = sizeof(round) + 1;
+        memcpy(buf + off, &engine->checkpoint_format, sizeof(SnapshotFormat));
+        off += sizeof(SnapshotFormat);
+        // Prepend "QPDES" so the peer's validate_checkpoint admits a non-master save (same convention as DRAIN_START used).
+        int n = snprintf((char *)(buf + off), sizeof(buf) - off, "QPDES%s", engine->checkpoint_name);
+        len = off + (size_t)n + 1;                    // include the null terminator
+    }
+    buf[sizeof(round)] = requires_checkpoint;
+    Message sync_msg = create_message(buf, len, MSG_TYPE_SYNC, get_current_virtual_for_sync_message(engine));
+    pdes_engine_send(engine, &sync_msg);
+    printf("WWT: Sent sync message for round %lu at virtual time %lu ns (checkpoint=%u).\n", round, get_universal_virtual_time(engine), requires_checkpoint);
 }
 void finish_quantum(PDESWWT *wwt_engine){
     send_sync(wwt_engine);
@@ -272,6 +293,22 @@ void wwt_recivied_callback(void *opaque, Message *msg){
         }
         sync_count_increment(wwt_engine->sync_counts, msg_round);
         printf("WWT: Sync received for round %lu (count now %d)\n", msg_round, sync_count_get(wwt_engine->sync_counts, msg_round));
+
+        // Checkpoint request rides the barrier message. We consume this sync to cross msg_round, so we
+        // adopt the checkpoint (round = msg_round, plus the master's name/format) before we can pass it,
+        // even if we are already sitting at the end of the quantum.
+        uint8_t requires_checkpoint = (msg->len > sizeof(uint64_t)) ? msg->data[sizeof(uint64_t)] : 0;
+        if (requires_checkpoint && !wwt_engine->engine->notified_neighbors){
+            PDESEngine *engine = wwt_engine->engine;
+            engine->needs_to_checkpoint = true;
+            engine->notified_neighbors = true;        // committed; we do not re-flag our own sync
+            engine->checkpoint_quantum_round = msg_round;
+            size_t off = sizeof(uint64_t) + 1;
+            memcpy(&engine->checkpoint_format, msg->data + off, sizeof(SnapshotFormat));
+            off += sizeof(SnapshotFormat);
+            snprintf(engine->checkpoint_name, sizeof(engine->checkpoint_name), "%s", (const char *)(msg->data + off));
+            printf("[CKPT] adopted checkpoint via sync flag: round=%lu name=%s\n", msg_round, engine->checkpoint_name);
+        }
 
     } else if (msg->type == MSG_TYPE_NORMAL){
         /* Gate: until the first-sync handshake establishes our time base, park NORMAL
@@ -399,13 +436,13 @@ int notify_neighbors_for_drain(PDESEngine *engine, char * snapshot_name, Snapsho
 
 bool sync_checkpoint_check(){
     PDESWWT *wwt_engine = get_singleton_wwt_engine();
-    if(wwt_engine->engine->needs_to_checkpoint){
+    // Only act once the checkpoint round is committed: notified_neighbors is set the moment the
+    // requires_checkpoint flag rides a sync (send_sync on the initiator, or the adopt path on a peer),
+    // which is also when checkpoint_quantum_round is set. Before that the round isn't known.
+    if(wwt_engine->engine->needs_to_checkpoint && wwt_engine->engine->notified_neighbors){
         printf("[CKPT] sync_checkpoint_check: master=%d current_round=%lu ckpt_round=%lu notified=%d should_sync=%d\n",
                wwt_engine->engine->master, wwt_engine->current_quantum_round,
                wwt_engine->engine->checkpoint_quantum_round, wwt_engine->engine->notified_neighbors, wwt_engine->should_sync);
-        if(!wwt_engine->engine->notified_neighbors){
-            notify_neighbors_for_drain(wwt_engine->engine, wwt_engine->engine->checkpoint_name, wwt_engine->engine->checkpoint_format);
-        }
         // Create bh and reschedule this again
         if ((wwt_engine->current_quantum_round < wwt_engine->engine->checkpoint_quantum_round) && wwt_engine->should_sync){
             printf("Checkpoint quantum round %lu is less than current quantum round %lu\n", wwt_engine->engine->checkpoint_quantum_round, wwt_engine->current_quantum_round);
@@ -626,10 +663,8 @@ void quanta_sync(PDESWWT *wwt_engine){
 
     printf("===================WWT: going to pause for quantum %lu at virtual time %lu ns and universal time %lu ns.===================\n", wwt_engine->current_quantum_round, current_time, get_universal_virtual_time(wwt_engine->engine));
 
-    // Need to send notify neighbors before sync, or else before here and notify the neighbor might move to the next quantum
-    if(wwt_engine->engine->needs_to_checkpoint && !wwt_engine->engine->notified_neighbors){
-        notify_neighbors_for_drain(wwt_engine->engine, wwt_engine->engine->checkpoint_name, wwt_engine->engine->checkpoint_format);
-    }
+    // Checkpoint announcement now rides the sync itself (send_sync sets the requires_checkpoint flag),
+    // so there is no separate notify-before-sync step.
     if(wwt_engine->should_sync){
         // Else you'd fill up buffer
         send_sync(wwt_engine);

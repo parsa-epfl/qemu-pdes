@@ -82,8 +82,6 @@ PDESEngine *pdes_engine_create(
     engine->ready_to_exit = false;
     engine->end_message_sent = false;
     engine->intent_sent = false;
-    engine->peer_ckpt_done = false;
-    engine->peer_ckpt_round = 0;
 
 
 
@@ -189,14 +187,11 @@ void set_checkpoint_values_for_master(){
     engine->notified_neighbors = false;
     engine->needs_to_checkpoint = true;
     engine->checkpoint_format = SNAPSHOT_FORMAT_EXTERNAL_INCREMENTAL_BASE;
-    // TODO this is specific to wwt, need to generalize later, maybe include this in the message
-    PDESWWT *wwt_engine = get_singleton_wwt_engine();
-    // +2: round must be strictly ahead of BOTH nodes (peer is within ±1 of us) and the DRAIN_START is
-    // FIFO-enqueued before any later sync, so the peer adopts the round before it can cross it.
-    engine->checkpoint_quantum_round = wwt_engine->current_quantum_round + 2; // this is specific to wwt, need to generalize later
+    // Round is NOT chosen here: it is committed when send_sync rides the requires_checkpoint flag on
+    // the next barrier message — the round of that sync is the round both nodes checkpoint at.
     char* snapshot_name = "init_warmed";
     snprintf(engine->checkpoint_name, sizeof(engine->checkpoint_name), "%s", snapshot_name);
-    printf("Setting checkpoint values for master, snapshot name: %s, format: %d, quantum round: %lu\n", engine->checkpoint_name, engine->checkpoint_format, engine->checkpoint_quantum_round);
+    printf("Setting checkpoint values for master, snapshot name: %s, format: %d\n", engine->checkpoint_name, engine->checkpoint_format);
     // For now skipping
 }
 void process_message(PDESEngine *engine, Message *msg) {
@@ -233,12 +228,6 @@ void process_message(PDESEngine *engine, Message *msg) {
                   "permitted_to_exit was set. Peer cannot have sent END "
                   "yet per the INTENT/PERMISSION/END protocol.");
         qatomic_set(&engine->pair_has_finished, true);
-    }
-    if (msg->type == CHECKPOINT_DONE){
-        if (msg->len >= sizeof(uint64_t)){
-            memcpy(&engine->peer_ckpt_round, msg->data, sizeof(uint64_t));
-        }
-        engine->peer_ckpt_done = true;   /* main thread only (process_message via poll) */
     }
     if (msg->type==DRAIN_START){
         printf("PDES Engine received drain end message, marking drained as true.\n");
