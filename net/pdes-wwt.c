@@ -211,27 +211,31 @@ void send_sync(PDESWWT *wwt_engine){
     uint8_t buf[1006];
     uint64_t round = wwt_engine->current_quantum_round;
     memcpy(buf, &round, sizeof(round));               // [0..8) round
-    size_t len = sizeof(round) + 1;                   // [8] checkpoint flag
-    uint8_t requires_checkpoint = 0;
-    // Piggyback the checkpoint request on the barrier message itself: the round we flag is the round we
-    // (and the peer, on consuming this very sync) checkpoint at. A peer cannot cross this round without
-    // first consuming this sync, so it learns the round before it can pass it — no announcement lag.
-    // notified_neighbors is the "already committed/flagged" latch.
+    size_t off = sizeof(round) + 1;                   // [8] = CTRL_* bitmask
+    uint8_t ctrl = 0;
+    // Checkpoint REQUEST rides the barrier message: the round we flag is the round both nodes
+    // checkpoint at. A peer cannot cross this round without first consuming this sync, so it learns the
+    // round before it can pass it — no announcement lag. notified_neighbors is the "already flagged" latch.
     if (engine->needs_to_checkpoint && !engine->notified_neighbors){
-        requires_checkpoint = 1;
+        ctrl |= CTRL_CKP_REQUEST;
         engine->notified_neighbors = true;
         engine->checkpoint_quantum_round = round;     // commit: checkpoint at this round
-        size_t off = sizeof(round) + 1;
         memcpy(buf + off, &engine->checkpoint_format, sizeof(SnapshotFormat));
         off += sizeof(SnapshotFormat);
-        // Prepend "QPDES" so the peer's validate_checkpoint admits a non-master save (same convention as DRAIN_START used).
+        // Prepend "QPDES" so the peer's validate_checkpoint admits a non-master save.
         int n = snprintf((char *)(buf + off), sizeof(buf) - off, "QPDES%s", engine->checkpoint_name);
-        len = off + (size_t)n + 1;                    // include the null terminator
+        off += (size_t)n + 1;                         // include the null terminator
     }
-    buf[sizeof(round)] = requires_checkpoint;
-    Message sync_msg = create_message(buf, len, MSG_TYPE_SYNC, get_current_virtual_for_sync_message(engine));
+    // Exit handshake + checkpoint-init signals: each rides the sync once then is cleared. xchg so a
+    // concurrent set from the Flexus thread (can_stop) between gather and clear isn't lost.
+    if (qatomic_xchg(&engine->pending_ckp_init, false))   ctrl |= CTRL_CKP_INIT;
+    if (qatomic_xchg(&engine->pending_intent, false))     ctrl |= CTRL_INTENT;
+    if (qatomic_xchg(&engine->pending_permission, false)) ctrl |= CTRL_PERMISSION;
+    if (qatomic_xchg(&engine->pending_end, false))        ctrl |= CTRL_END;
+    buf[sizeof(round)] = ctrl;
+    Message sync_msg = create_message(buf, off, MSG_TYPE_SYNC, get_current_virtual_for_sync_message(engine));
     pdes_engine_send(engine, &sync_msg);
-    // printf("WWT: Sent sync message for round %lu at virtual time %lu ns (checkpoint=%u).\n", round, get_universal_virtual_time(engine), requires_checkpoint);
+    // printf("WWT: Sent sync message for round %lu at virtual time %lu ns (ctrl=0x%02x).\n", round, get_universal_virtual_time(engine), ctrl);
 }
 void finish_quantum(PDESWWT *wwt_engine){
     send_sync(wwt_engine);
@@ -291,14 +295,18 @@ void wwt_recivied_callback(void *opaque, Message *msg){
             }
             assert (valid_round && "Received sync message for wrong quantum round, this should not happen");
         }
-        sync_count_increment(wwt_engine->sync_counts, msg_round);
+        // sync_count drives the barrier, which is only used when syncing; skip it when off so we don't
+        // grow the hash for the empty syncs we now emit every quantum while sync is off.
+        if (wwt_engine->should_sync){
+            sync_count_increment(wwt_engine->sync_counts, msg_round);
+        }
         // printf("WWT: Sync received for round %lu (count now %d)\n", msg_round, sync_count_get(wwt_engine->sync_counts, msg_round));
 
         // Checkpoint request rides the barrier message. We consume this sync to cross msg_round, so we
         // adopt the checkpoint (round = msg_round, plus the master's name/format) before we can pass it,
         // even if we are already sitting at the end of the quantum.
-        uint8_t requires_checkpoint = (msg->len > sizeof(uint64_t)) ? msg->data[sizeof(uint64_t)] : 0;
-        if (requires_checkpoint && !wwt_engine->engine->notified_neighbors){
+        uint8_t ctrl = (msg->len > sizeof(uint64_t)) ? msg->data[sizeof(uint64_t)] : 0;
+        if ((ctrl & CTRL_CKP_REQUEST) && !wwt_engine->engine->notified_neighbors){
             PDESEngine *engine = wwt_engine->engine;
             engine->needs_to_checkpoint = true;
             engine->notified_neighbors = true;        // committed; we do not re-flag our own sync
@@ -571,10 +579,8 @@ void wwt_sync_check(){
                 && qatomic_read(&engine->ready_to_exit)
                 && !qatomic_read(&engine->permitted_to_exit)){
                 qatomic_set(&engine->permitted_to_exit, true);
-                // Send PERMISSION_TO_END_EMULATION message to neighbor
-                Message permission_to_end_msg = create_message(NULL, 0, PERMISSION_TO_END_EMULATION, get_universal_virtual_time(engine));
-                pdes_comm_send(engine->comm, &permission_to_end_msg);
-                printf("Master received intent to end emulation message, permitting neighbor to exit and sending permission message back.\n");
+                qatomic_set(&engine->pending_permission, true);   // rides the next sync (CTRL_PERMISSION)
+                printf("Master permitting neighbor to exit; PERMISSION queued on sync.\n");
                 // permitted_to_exit just flipped — flush any END deferred by
                 // notify_neighbours_of_end (Flexus may have asked to exit
                 // before the handshake completed).
@@ -663,12 +669,11 @@ void quanta_sync(PDESWWT *wwt_engine){
 
     // printf("===================WWT: going to pause for quantum %lu at virtual time %lu ns and universal time %lu ns.===================\n", wwt_engine->current_quantum_round, current_time, get_universal_virtual_time(wwt_engine->engine));
 
-    // Checkpoint announcement now rides the sync itself (send_sync sets the requires_checkpoint flag),
-    // so there is no separate notify-before-sync step.
-    if(wwt_engine->should_sync){
-        // Else you'd fill up buffer
-        send_sync(wwt_engine);
-    }
+    // All control signals (checkpoint + exit handshake) ride the sync, so we emit one every quantum
+    // even when sync is off — otherwise an off node could never deliver a checkpoint/exit signal.
+    // TODO: when sync is off, only emit a sync when it actually carries a CTRL_* flag, to avoid
+    // flooding long sync-off phases (e.g. boot) with empty syncs.
+    send_sync(wwt_engine);
 
 
 

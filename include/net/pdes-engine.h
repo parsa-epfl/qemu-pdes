@@ -86,6 +86,16 @@ struct PDESEngine {
     bool ready_to_exit;
     bool end_message_sent;
     bool intent_sent;
+
+    // Control signals queued to ride the next sync (see CTRL_* in pdes-communicator.h). Some are set
+    // from the Flexus thread (can_stop) and consumed on the main thread (send_sync) — accessed via qatomic.
+    // "ckp_init" = checkpoint *initiate* (peer->master "I'm ready"), general to any master-coordinated
+    // checkpoint — NOT init_warmed-specific. The master->peer announcement itself is CTRL_CKP_REQUEST,
+    // which carries an arbitrary snapshot name and works for every master-initiated checkpoint.
+    bool pending_ckp_init;
+    bool pending_intent;
+    bool pending_permission;
+    bool pending_end;
 };
 
 PDESEngine *pdes_engine_create(

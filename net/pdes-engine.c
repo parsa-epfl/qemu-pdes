@@ -82,6 +82,10 @@ PDESEngine *pdes_engine_create(
     engine->ready_to_exit = false;
     engine->end_message_sent = false;
     engine->intent_sent = false;
+    engine->pending_ckp_init = false;
+    engine->pending_intent = false;
+    engine->pending_permission = false;
+    engine->pending_end = false;
 
 
 
@@ -111,9 +115,8 @@ void _send_end_if_handshake_complete(PDESEngine *engine){
      * permitted_to_exit flips" invariant survives concurrent callers. */
     if(!qatomic_read(&engine->permitted_to_exit)) return;
     if(qatomic_xchg(&engine->end_message_sent, true)) return;
-    Message mssg = create_message(NULL, 0, END_OF_EMULATION, get_current_virtual_for_destroy_message(engine));
-    pdes_comm_send(engine->comm, &mssg);
-    printf("END_OF_EMULATION sent.\n");
+    qatomic_set(&engine->pending_end, true);   // rides the next sync (CTRL_END)
+    printf("END_OF_EMULATION queued on sync.\n");
 }
 
 void notify_neighbours_of_end(PDESEngine *engine){
@@ -179,7 +182,11 @@ void initiate_checkpoint_master(void *context){
 
     return;
 }
-void set_checkpoint_values_for_master(){
+// Master-side: stage a master-initiated checkpoint of the given name for ALL peers. The name is a
+// parameter (NOT hardcoded to init_warmed) so this is the general "master tells peers to checkpoint"
+// entry point — send_sync then rides CTRL_CKP_REQUEST + this name on the next barrier and each peer
+// adopts it and checkpoints at the agreed round.
+void set_checkpoint_values_for_master(const char *snapshot_name){
     // if master is ready to initiate checkpoint start it
     PDESEngine *engine = get_singleton_engine();
     printf("Master is already initialized, initiating checkpoint immediately.\n");
@@ -189,7 +196,6 @@ void set_checkpoint_values_for_master(){
     engine->checkpoint_format = SNAPSHOT_FORMAT_EXTERNAL_INCREMENTAL_BASE;
     // Round is NOT chosen here: it is committed when send_sync rides the requires_checkpoint flag on
     // the next barrier message — the round of that sync is the round both nodes checkpoint at.
-    char* snapshot_name = "init_warmed";
     snprintf(engine->checkpoint_name, sizeof(engine->checkpoint_name), "%s", snapshot_name);
     printf("Setting checkpoint values for master, snapshot name: %s, format: %d\n", engine->checkpoint_name, engine->checkpoint_format);
     // For now skipping
@@ -201,6 +207,35 @@ void process_message(PDESEngine *engine, Message *msg) {
 
 
     // printf("PDES Engine received message of type %u with timestamp %lu ns and len %u bytes.\n", msg->type, msg->ts_ns, msg->len);
+
+    // All control signals now ride the sync (CTRL_* bits in the byte at offset sizeof(round)); they are
+    // therefore consumed at the quantum barrier when sync is on, and immediately (via the poll) when
+    // off. The checkpoint REQUEST (CTRL_CKP_REQUEST) is handled in wwt_recivied_callback (recv_cb,
+    // already run above); here we handle the exit handshake + checkpoint-init effects. PERMISSION is
+    // processed before END so a single sync carrying both keeps the "permitted before END" invariant.
+    if (msg->type == MSG_TYPE_SYNC){
+        uint8_t ctrl = (msg->len > sizeof(uint64_t)) ? msg->data[sizeof(uint64_t)] : 0;
+        if (ctrl & CTRL_CKP_INIT){
+            engine->init_flag++;
+            if (engine->master && engine->init_flag == 1 && engine->master_init){
+                set_checkpoint_values_for_master("init_warmed");
+            }
+        }
+        if (ctrl & CTRL_INTENT){
+            if (engine->master){
+                qatomic_inc(&engine->ready_to_exit_neighbors);
+            }
+        }
+        if (ctrl & CTRL_PERMISSION){
+            qatomic_set(&engine->permitted_to_exit, true);
+            _send_end_if_handshake_complete(engine);
+        }
+        if (ctrl & CTRL_END){
+            assert(qatomic_read(&engine->permitted_to_exit)
+                   && "process_message: got CTRL_END before our permitted_to_exit was set.");
+            qatomic_set(&engine->pair_has_finished, true);
+        }
+    }
 
     // TODO both drain start and and end are based on just one neighbor for now, need to generalize later
     if(msg->type == INTENT_TO_END_EMULATION){
@@ -286,7 +321,7 @@ void process_message(PDESEngine *engine, Message *msg) {
         if (engine->master){
             printf("This is a master, checking if we can initiate checkpoint immediately or need to wait for next initiation message.\n");
             if (engine->init_flag == 1 && engine->master_init){
-                set_checkpoint_values_for_master();
+                set_checkpoint_values_for_master("init_warmed");
             }else{
                 printf("Master received checkpoint initiation message, but master init flag is not set, marking master as ready and waiting for next checkpoint initiation message.\n");
             }
@@ -403,16 +438,15 @@ void finish_initiate_checkpoint(PDESEngine *engine){
 
             // Make sure neighbors know they can checkpoint at end of quantum
             // and set flags for our selves as well
-            set_checkpoint_values_for_master();
+            set_checkpoint_values_for_master("init_warmed");
             printf("Master sent drain start message for checkpoint initiation to neighbors, waiting for neighbors to drain and checkpoint.\n");
         }else{
             printf("Master received checkpoint initiation message, but init flag is not set, marking master as ready and waiting for next checkpoint initiation message.\n");
             return;
         }
     }else{
-        int res = send_initiate_checkpoint_message(engine);
-        assert (res == 0 && "Failed to send checkpoint initiation message to master");
-        printf("Sent checkpoint initiation message to master, returning.\n");
+        engine->pending_ckp_init = true;   // rides the next sync (CTRL_CKP_INIT)
+        printf("Checkpoint init queued on sync for master.\n");
     }
 }
 
@@ -423,15 +457,13 @@ bool can_stop(PDESEngine *engine){
      * lost. intent_sent stays local — only this function ever touches it. */
     if (!engine->master){
         if(!engine->intent_sent){
-            Message intent_msg = create_message(NULL, 0, INTENT_TO_END_EMULATION, get_universal_virtual_time(engine));
-            pdes_comm_send(engine->comm, &intent_msg);
+            qatomic_set(&engine->pending_intent, true);   // rides the next sync (CTRL_INTENT)
             engine->intent_sent = true;
         }
     } else if(qatomic_read(&engine->ready_to_exit_neighbors) >= 1
              && !qatomic_read(&engine->permitted_to_exit)){
         qatomic_set(&engine->permitted_to_exit, true);
-        Message permission_msg = create_message(NULL, 0, PERMISSION_TO_END_EMULATION, get_universal_virtual_time(engine));
-        pdes_comm_send(engine->comm, &permission_msg);
+        qatomic_set(&engine->pending_permission, true);   // rides the next sync (CTRL_PERMISSION)
         _send_end_if_handshake_complete(engine);
     }
     qatomic_set(&engine->ready_to_exit, true);

@@ -20,6 +20,15 @@ typedef struct PDESCommunicator PDESCommunicator;
 #define INTENT_TO_END_EMULATION 7
 #define PERMISSION_TO_END_EMULATION 8
 
+// Control signals carried in the byte at offset sizeof(round) of a MSG_TYPE_SYNC, so that all
+// coordination is delivered/processed together at the quantum barrier (or immediately when sync is
+// off). The standalone message types above are kept only for backward-compat / dead handlers.
+#define CTRL_CKP_REQUEST  0x01   // master->peer: checkpoint at this sync's round (format+name follow)
+#define CTRL_CKP_INIT     0x02   // peer->master: warmed and ready to checkpoint
+#define CTRL_INTENT       0x04   // follower->master: intent to end emulation
+#define CTRL_PERMISSION   0x08   // master->follower: permission to end emulation
+#define CTRL_END          0x10   // either: this node has ended
+
 typedef struct {
     uint64_t ts_ns;       /* timestamp in nanoseconds */
     uint32_t len;
