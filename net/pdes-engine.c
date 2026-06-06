@@ -200,7 +200,7 @@ void process_message(PDESEngine *engine, Message *msg) {
     engine->recv_cb(engine->recv_opaque, msg);
 
 
-    printf("PDES Engine received message of type %u with timestamp %lu ns and len %u bytes.\n", msg->type, msg->ts_ns, msg->len);
+    // printf("PDES Engine received message of type %u with timestamp %lu ns and len %u bytes.\n", msg->type, msg->ts_ns, msg->len);
 
     // TODO both drain start and and end are based on just one neighbor for now, need to generalize later
     if(msg->type == INTENT_TO_END_EMULATION){
@@ -263,7 +263,7 @@ void process_message(PDESEngine *engine, Message *msg) {
             engine->checkpoint_quantum_round = quantum_round;
 
             printf("Parsed checkpoint initiation message, snapshot name: %s, format: %d, quantum round: %lu\n", engine->checkpoint_name, format, quantum_round);
-            printf("[CKPT] peer adopted ckpt_round=%lu while current_round=%lu (needs_to_checkpoint set)\n", quantum_round, get_singleton_wwt_engine()->current_quantum_round);
+            // printf("[CKPT] peer adopted ckpt_round=%lu while current_round=%lu (needs_to_checkpoint set)\n", quantum_round, get_singleton_wwt_engine()->current_quantum_round);
 
 
 

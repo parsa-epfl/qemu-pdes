@@ -292,8 +292,8 @@ bool validate_checkpoint(const char **check_point_name){
 void create_checkpoint_bh(bool exit_after){
     PDESWWT *wwt_engine = get_singleton_wwt_engine();
     if (!wwt_engine->engine->needs_to_checkpoint){
-        printf("[CKPT] create_checkpoint_bh fired but needs_to_checkpoint=false, SKIPPING (master=%d round=%lu)\n",
-               wwt_engine->engine->master, wwt_engine->current_quantum_round);
+        // printf("[CKPT] create_checkpoint_bh fired but needs_to_checkpoint=false, SKIPPING (master=%d round=%lu)\n",
+        //        wwt_engine->engine->master, wwt_engine->current_quantum_round);
         return;
     }
 
