@@ -229,15 +229,28 @@ void send_sync(PDESWWT *wwt_engine){
         int n = snprintf((char *)(buf + off), sizeof(buf) - off, "QPDES%s", engine->checkpoint_name);
         off += (size_t)n + 1;                         // include the null terminator
     }
-    // Exit handshake + checkpoint-init signals: each rides the sync once then is cleared. xchg so a
-    // concurrent set from the Flexus thread (can_stop) between gather and clear isn't lost.
-    if (qatomic_xchg(&engine->pending_ckp_init, false))   ctrl |= CTRL_CKP_INIT;
-    if (qatomic_xchg(&engine->pending_intent, false))     ctrl |= CTRL_INTENT;
-    if (qatomic_xchg(&engine->pending_permission, false)) ctrl |= CTRL_PERMISSION;
-    if (qatomic_xchg(&engine->pending_end, false))        ctrl |= CTRL_END;
+    // Checkpoint-init: peer->master "ready to checkpoint", rides the sync once.
+    if (qatomic_xchg(&engine->pending_ckp_init, false)) ctrl |= CTRL_CKP_INIT;
+    // Exit handshake: peer announces readiness once; master broadcasts cleanup once it and all peers are
+    // ready. self_ready is set by can_stop on the Flexus thread (qatomic).
+    bool sending_cleanup = false;
+    if (!engine->master){
+        if (qatomic_read(&engine->self_ready) && !engine->ready_sent){
+            ctrl |= CTRL_READY;
+            engine->ready_sent = true;
+        }
+    } else if (qatomic_read(&engine->self_ready)
+               && qatomic_read(&engine->ready_peers) >= wwt_engine->number_of_neighbors
+               && !qatomic_read(&engine->cleanup_sent)){
+        ctrl |= CTRL_CLEANUP;
+        sending_cleanup = true;
+    }
     buf[sizeof(round)] = ctrl;
     Message sync_msg = create_message(buf, off, MSG_TYPE_SYNC, get_current_virtual_for_sync_message(engine));
     pdes_engine_send(engine, &sync_msg);
+    // Mark cleanup_sent only AFTER the CLEANUP is in shm, so the master (whose can_stop runs on the
+    // Flexus thread) can never terminate before the peer can see CLEANUP.
+    if (sending_cleanup) qatomic_set(&engine->cleanup_sent, true);
     // printf("WWT: Sent sync message for round %lu at virtual time %lu ns (ctrl=0x%02x).\n", round, get_universal_virtual_time(engine), ctrl);
 }
 void finish_quantum(PDESWWT *wwt_engine){
@@ -454,37 +467,22 @@ void wwt_sync_check(){
     while(waiting){
         // Poll for messages while waiting to avoid blocking message processing
         pdes_engine_poll(wwt_engine->engine);
-        // Peer sent END_OF_EMULATION. Per the protocol, peer can only send
-        // END after the INTENT/PERMISSION exchange completed, which means
-        // OUR permitted_to_exit is already set — master sets it when
-        // granting permission (before _send_end_if_handshake_complete);
-        // follower sets it when receiving PERMISSION (which arrives before
-        // master's END in send order). So we were already ready to exit
-        // when peer's END landed, and the only honest thing to do is exit
-        // here instead of spinning waiting for a sync that will never come.
-        if (qatomic_read(&wwt_engine->engine->pair_has_finished)){
-            assert(qatomic_read(&wwt_engine->engine->permitted_to_exit)
-                   && "wwt_sync_check: pair_has_finished is set but our "
-                      "permitted_to_exit isn't — peer sent END_OF_EMULATION "
-                      "before our handshake completed. The END handshake "
-                      "invariant is broken upstream (check process_message "
-                      "PERMISSION arm and the master arm in wwt_sync_check / "
-                      "can_stop).");
+        // Terminate from the main thread if we may stop now (master: CLEANUP sent; peer: CLEANUP
+        // received). Needed because Flexus is paused at the barrier and can't poll can_stop itself, and
+        // because the peer that sent us CLEANUP/READY may have stopped sending further syncs — so we
+        // must not spin waiting for a sync that will never come. Our own exit signal already went out:
+        // the master's CLEANUP is in shm before cleanup_sent is set; a peer has already sent its READY.
+        bool may_stop = wwt_engine->engine->master
+                            ? qatomic_read(&wwt_engine->engine->cleanup_sent)
+                            : qatomic_read(&wwt_engine->engine->cleanup_received);
+        if (may_stop){
 #ifdef CONFIG_LIBQFLEX
             if (flexus_api.stop != NULL){
-                /* Drive Flexus's terminateSimulation from the main thread.
-                 * Flexus thread is paused (pdes_pause from a prior
-                 * quanta_sync) so Flexus internals are quiescent; this is
-                 * the same path the Flexus-side stopcycle check would have
-                 * taken on its own thread once both flags were set.
-                 * terminateSimulation writes all.measurement.end.log then
-                 * exit(0)s — does not return. */
+                /* terminateSimulation writes all.measurement.end.log then exit(0)s — does not return. */
                 flexus_api.stop();
             }
 #endif
-            /* Belt-and-suspenders: if libqflex is off or flexus_api.stop
-             * unexpectedly returned, fall through to the engine-destroy
-             * path which calls exit(0). */
+            /* Belt-and-suspenders if libqflex is off or flexus_api.stop returned. */
             pdes_engine_destroy(wwt_engine->engine);
             return; /* unreachable */
         }
@@ -532,27 +530,8 @@ void wwt_sync_check(){
         timer_free(wwt_engine->sync_check_timer);
         wwt_engine->sync_check_timer = NULL;
 
-
-        PDESEngine *engine = wwt_engine->engine;
-        if(engine->master){
-            // TODO again dependant to 2 nodes
-            // TODO make this more general to not be reliant on conservative boundaries
-            // TODO factor it out like the checkpoint portion
-            /* All three flags are cross-thread (set by can_stop on the
-             * Flexus thread and the PERMISSION arm on the main thread); use
-             * qatomic_* so we don't miss an INTENT or double-flip the flag. */
-            if (qatomic_read(&engine->ready_to_exit_neighbors) >= 1
-                && qatomic_read(&engine->ready_to_exit)
-                && !qatomic_read(&engine->permitted_to_exit)){
-                qatomic_set(&engine->permitted_to_exit, true);
-                qatomic_set(&engine->pending_permission, true);   // rides the next sync (CTRL_PERMISSION)
-                printf("Master permitting neighbor to exit; PERMISSION queued on sync.\n");
-                // permitted_to_exit just flipped — flush any END deferred by
-                // notify_neighbours_of_end (Flexus may have asked to exit
-                // before the handshake completed).
-                _send_end_if_handshake_complete(engine);
-            }
-        }
+        // The exit decision (master broadcasting CTRL_CLEANUP once self_ready && all peers ready) lives
+        // entirely in send_sync now — nothing to do here.
 
         // TODO number_of_neighbors_finished should be deprecated
         wwt_engine->number_of_neighbors_finished -= wwt_engine->number_of_neighbors;
@@ -581,7 +560,7 @@ void wwt_sync_check(){
         int64_t next_quantum_time_local = next_quantum_time + wwt_engine->engine->first_sync_virtual_time;
         timer_mod(wwt_engine->quantum_timer, next_quantum_time_local);
         // call play to resume
-        // printf("===================WWT: Finished quantum %lu at virtual time %lu ns and universal time %lu ns.===================\n", wwt_engine->current_quantum_round - 1, current_time, get_universal_virtual_time(wwt_engine->engine));
+        printf("===================WWT: Finished quantum %lu at virtual time %lu ns and universal time %lu ns.===================\n", wwt_engine->current_quantum_round - 1, current_time, get_universal_virtual_time(wwt_engine->engine));
         if(wwt_engine->should_sync){
             pdes_play(wwt_engine->engine);
         }
@@ -633,7 +612,7 @@ void quanta_sync(PDESWWT *wwt_engine){
 
 
 
-    // printf("===================WWT: going to pause for quantum %lu at virtual time %lu ns and universal time %lu ns.===================\n", wwt_engine->current_quantum_round, current_time, get_universal_virtual_time(wwt_engine->engine));
+    printf("===================WWT: going to pause for quantum %lu at virtual time %lu ns and universal time %lu ns.===================\n", wwt_engine->current_quantum_round, current_time, get_universal_virtual_time(wwt_engine->engine));
 
     // All control signals (checkpoint + exit handshake) ride the sync, so we emit one every quantum
     // even when sync is off — otherwise an off node could never deliver a checkpoint/exit signal.

@@ -19,9 +19,8 @@ typedef struct PDESCommunicator PDESCommunicator;
 // Control signals carried in the byte at offset sizeof(round) of a MSG_TYPE_SYNC.
 #define CTRL_CKP_REQUEST  0x01   // master->peer: checkpoint at this sync's round (format+name follow)
 #define CTRL_CKP_INIT     0x02   // peer->master: warmed and ready to checkpoint
-#define CTRL_INTENT       0x04   // follower->master: intent to end emulation
-#define CTRL_PERMISSION   0x08   // master->follower: permission to end emulation
-#define CTRL_END          0x10   // either: this node has ended
+#define CTRL_READY        0x04   // peer->master: this node's Flexus is ready to stop
+#define CTRL_CLEANUP      0x08   // master->peer: everyone is ready, terminate
 
 typedef struct {
     uint64_t ts_ns;       /* timestamp in nanoseconds */

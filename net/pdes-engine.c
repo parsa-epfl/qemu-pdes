@@ -56,7 +56,6 @@ PDESEngine *pdes_engine_create(
     engine->received_first_sync = false;
     engine->deferred_normal = g_queue_new();
     engine->waiting_for_quanta = false;
-    engine->pair_has_finished = false;
     engine->base_diff = 0;
     engine->paused = false;
     engine->pause_status_cb = pause_status_cb;
@@ -74,15 +73,12 @@ PDESEngine *pdes_engine_create(
     engine->notified_neighbors = false;
     engine->boundry_checkpoint_bh = NULL;
     engine->skip_boundry_check_after_checkpoint = false;
-    engine->ready_to_exit_neighbors = 0;
-    engine->permitted_to_exit = false;
-    engine->ready_to_exit = false;
-    engine->end_message_sent = false;
-    engine->intent_sent = false;
+    engine->self_ready = false;
+    engine->ready_peers = 0;
+    engine->cleanup_sent = false;
+    engine->cleanup_received = false;
+    engine->ready_sent = false;
     engine->pending_ckp_init = false;
-    engine->pending_intent = false;
-    engine->pending_permission = false;
-    engine->pending_end = false;
 
 
 
@@ -102,24 +98,6 @@ PDESEngine *pdes_engine_create(
 }
 
 
-// Idempotent — emit END once permitted_to_exit is set. Decoupled from
-// notify_neighbours_of_end so we can fire it from the handshake path
-// without waiting for libqflex_stop.
-void _send_end_if_handshake_complete(PDESEngine *engine){
-    /* Both flags are set across threads (main thread on the PERMISSION arm,
-     * Flexus thread in can_stop, main thread in wwt_sync_check master arm)
-     * — read/write atomically so the "send END exactly once after our
-     * permitted_to_exit flips" invariant survives concurrent callers. */
-    if(!qatomic_read(&engine->permitted_to_exit)) return;
-    if(qatomic_xchg(&engine->end_message_sent, true)) return;
-    qatomic_set(&engine->pending_end, true);   // rides the next sync (CTRL_END)
-    printf("END_OF_EMULATION queued on sync.\n");
-}
-
-void notify_neighbours_of_end(PDESEngine *engine){
-    // Queue END if the handshake is complete; idempotent via end_message_sent.
-    _send_end_if_handshake_complete(engine);
-}
 // TODO clean this up, destroying needs clean up
 void destroy_strategy(){
     PDESWWT *wwt_engine = get_singleton_wwt_engine();
@@ -132,8 +110,8 @@ void destroy_strategy(){
     }
 }
 void pdes_engine_destroy(PDESEngine *engine) {
-    // Notify neighbors that we are ending the simulation
-    notify_neighbours_of_end(engine);
+    // By the time we tear down, our exit signal (READY as a peer, or CLEANUP as the master) has
+    // already gone out on a sync — nothing left to announce here.
     if(engine->needs_to_checkpoint){
         // Create bh
         if (!engine->boundry_checkpoint_bh){
@@ -218,19 +196,11 @@ void process_message(PDESEngine *engine, Message *msg) {
                 set_checkpoint_values_for_master("init_warmed");
             }
         }
-        if (ctrl & CTRL_INTENT){
-            if (engine->master){
-                qatomic_inc(&engine->ready_to_exit_neighbors);
-            }
+        if ((ctrl & CTRL_READY) && engine->master){
+            qatomic_inc(&engine->ready_peers);   // a peer's Flexus is ready to stop
         }
-        if (ctrl & CTRL_PERMISSION){
-            qatomic_set(&engine->permitted_to_exit, true);
-            _send_end_if_handshake_complete(engine);
-        }
-        if (ctrl & CTRL_END){
-            assert(qatomic_read(&engine->permitted_to_exit)
-                   && "process_message: got CTRL_END before our permitted_to_exit was set.");
-            qatomic_set(&engine->pair_has_finished, true);
+        if (ctrl & CTRL_CLEANUP){
+            qatomic_set(&engine->cleanup_received, true);   // master says: terminate
         }
     }
 
@@ -337,25 +307,13 @@ void finish_initiate_checkpoint(PDESEngine *engine){
 }
 
 bool can_stop(PDESEngine *engine){
-    /* can_stop runs on the Flexus thread; the flags it touches (and the
-     * counter it reads) are also written from the main thread (process_message,
-     * wwt_sync_check master arm). Use qatomic_* so concurrent updates aren't
-     * lost. intent_sent stays local — only this function ever touches it. */
-    if (!engine->master){
-        if(!engine->intent_sent){
-            qatomic_set(&engine->pending_intent, true);   // rides the next sync (CTRL_INTENT)
-            engine->intent_sent = true;
-        }
-    } else if(qatomic_read(&engine->ready_to_exit_neighbors) >= 1
-             && !qatomic_read(&engine->permitted_to_exit)){
-        qatomic_set(&engine->permitted_to_exit, true);
-        qatomic_set(&engine->pending_permission, true);   // rides the next sync (CTRL_PERMISSION)
-        _send_end_if_handshake_complete(engine);
+    /* Runs on the Flexus thread. Record that this node's Flexus is ready to stop (send_sync reads this
+     * on the main thread to emit CTRL_READY / CTRL_CLEANUP) and report whether we may terminate yet.
+     * Never blocks: the master terminates once it has broadcast CLEANUP, a peer once it has received it.
+     * qatomic because send_sync/process_message touch these on the main thread. */
+    qatomic_set(&engine->self_ready, true);
+    if (engine->master){
+        return qatomic_read(&engine->cleanup_sent);
     }
-    qatomic_set(&engine->ready_to_exit, true);
-    // Both sides exit together: only when our handshake is permitted AND
-    // peer's END has arrived. The natural WWT barrier keeps both ticking
-    // (and exchanging sync) up to that point.
-    return qatomic_read(&engine->permitted_to_exit)
-        && qatomic_read(&engine->pair_has_finished);
+    return qatomic_read(&engine->cleanup_received);
 }
