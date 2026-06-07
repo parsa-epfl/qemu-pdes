@@ -91,6 +91,12 @@ struct PDESEngine {
     // checkpoint — NOT init_warmed-specific. The master->peer announcement itself is CTRL_CKP_REQUEST,
     // which carries an arbitrary snapshot name and works for every master-initiated checkpoint.
     bool pending_ckp_init;
+
+    // FW (WormCache) exit: set on the master when the plugin has taken its final periodic snapshot
+    // (qemu_plugin_pdes_fw_complete), and on a peer when it adopts CTRL_CKP_FINAL. Once the final
+    // coordinated checkpoint is written (create_checkpoint_bh), the node sets self_ready and joins the
+    // CTRL_READY/CTRL_CLEANUP handshake, so the plugin no longer exit(0)s before that last file lands.
+    bool fw_exit_after_checkpoint;
 };
 
 PDESEngine *pdes_engine_create(

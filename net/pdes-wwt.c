@@ -38,6 +38,18 @@ PDESWWT *get_singleton_wwt_engine(){
     return singleton_wwt_engine;
 }
 
+/* The intra-machine Parallel Warming Quantum (PWQ) in ns — the across-cores barrier step,
+ * NOT the cross-node MNQ. In the FW build VT advances one PWQ per barrier release; -icount
+ * sets icount_switch_period, -quantum sets quantum_size, and both equal --quantum-size. The
+ * timing build (qemu/) has no PWQ — Flexus tick drives VT one cycle at a time — so 0. */
+static int64_t wwt_pwq_ns(void){
+#ifdef CONFIG_LIBQFLEX
+    return 0;
+#else
+    return (int64_t)(icount_switch_period ? icount_switch_period : quantum_size);
+#endif
+}
+
 /* Boundary-landing tolerance: OUR OWN VT vs OUR expected quantum boundary (a self
  * check — see wwt_within_drift). This is NOT the cross-node message-skew bound below;
  * keep the two separate.
@@ -48,22 +60,18 @@ PDESWWT *get_singleton_wwt_engine(){
  * boundary — bound is PWQ.
  * Timing build (qemu/): Flexus tick drives VT, no PWQ — bound is 0. */
 static int64_t wwt_drift_bound_ns(void){
-#ifdef CONFIG_LIBQFLEX
-    return 0;
-#else
-    int64_t pwq = (int64_t)(icount_switch_period ? icount_switch_period : quantum_size);
-    return icount_enabled() ? 0 : pwq;
-#endif
+    return icount_enabled() ? 0 : wwt_pwq_ns();
 }
 
 /* Cross-node message-skew tolerance: how far behind OUR VT a PEER's packet timestamp
- * may legitimately be. Synced peers resync only once per multi-node quantum, so between
- * syncs a peer can be up to one quantum behind us — in EVERY build (timing included).
- * Distinct from wwt_drift_bound_ns() (the boundary-landing self bound, legitimately 0 in
- * the timing build); do not merge the two. Sourced from the engine's own sync period so
- * it can never diverge from the quantum the engine actually syncs on. */
+ * may legitimately be — one PWQ. Between barrier releases a synced peer can lag us by at
+ * most one intra-machine quantum step, so a packet it sent can read up to one PWQ behind.
+ * Distinct from wwt_drift_bound_ns(): in icount mode that self bound is 0 while this skew
+ * bound is still PWQ (the quantum size), so do not merge the two. 0 in the timing build,
+ * where Flexus ticks lockstep and there is no PWQ. */
 static int64_t wwt_msg_skew_bound_ns(PDESWWT *wwt){
-    return wwt->quantum_ns;
+    (void)wwt;
+    return wwt_pwq_ns();
 }
 
 /* |actual - expected| <= wwt_drift_bound_ns(). Two-sided — for the quantum
@@ -239,6 +247,10 @@ void send_sync(PDESWWT *wwt_engine){
     // the master's request — keeping its own (non-QPDES) name + round, which validate_checkpoint skips.
     if (engine->master && engine->needs_to_checkpoint && !engine->notified_neighbors){
         ctrl |= CTRL_CKP_REQUEST;
+        if (engine->fw_exit_after_checkpoint){
+            ctrl |= CTRL_CKP_FINAL;   // last FW snapshot: peer joins the exit handshake after writing it
+            PDES_VLOG("WWT: flagging CTRL_CKP_FINAL on checkpoint %s (FW exit).\n", engine->checkpoint_name);
+        }
         engine->notified_neighbors = true;
         engine->checkpoint_quantum_round = round;     // commit: checkpoint at this round
         memcpy(buf + off, &engine->checkpoint_format, sizeof(SnapshotFormat));
@@ -350,6 +362,10 @@ void wwt_recivied_callback(void *opaque, Message *msg){
             off += sizeof(SnapshotFormat);
             snprintf(engine->checkpoint_name, sizeof(engine->checkpoint_name), "%s", (const char *)(msg->data + off));
             // printf("[CKPT] adopted checkpoint via sync flag: round=%lu name=%s\n", msg_round, engine->checkpoint_name);
+            if (ctrl & CTRL_CKP_FINAL){
+                engine->fw_exit_after_checkpoint = true;   // exit after this (final FW) checkpoint lands
+                PDES_VLOG("WWT: adopted CTRL_CKP_FINAL; will exit after checkpoint round %lu.\n", msg_round);
+            }
         }
 
     } else if (msg->type == MSG_TYPE_NORMAL){
@@ -377,16 +393,19 @@ void wwt_recivied_callback(void *opaque, Message *msg){
 
         // Process at schedule or now + 1 which ever is later
         if (wwt_engine->should_sync) {
-            /* A peer's packet may be up to one multi-node quantum behind our VT: synced
-             * peers only resync once per quantum, so between syncs the peer can lag us by
-             * a quantum. Use the message-skew bound (NOT wwt_drift_bound_ns(), which is the
-             * boundary-landing self bound — 0 in the timing build). Future timestamps are
+            /* A peer's packet may be up to one PWQ (intra-machine quantum step) behind our
+             * VT: between barrier releases the peer can lag us by one quantum step. Use the
+             * message-skew bound (NOT wwt_drift_bound_ns(), which is the boundary-landing
+             * self bound — 0 in icount and in the timing build). Future timestamps are
              * always fine; the clamp below delivers a slightly-past packet in order. */
             int64_t bound = wwt_msg_skew_bound_ns(wwt_engine);
             if (translated_time + bound < current_virtual_time_translated) {
                 printf("WWT Engine received message with timestamp %lu ns while current virtual time is %lu (skew bound %ld)\n",
                        translated_time, current_virtual_time_translated, bound);
                 assert(false && "Received message with timestamp more than one quantum in the past while should_sync is enabled");
+            }else if (translated_time < current_virtual_time_translated){
+                printf("[DRIFT] WWT Engine received message with timestamp %lu ns while current virtual time is %lu ns, but it's within the skew bound of %ld ns, so accepting it.\n",
+                       translated_time, current_virtual_time_translated, bound);
             }
             /* Clamp to current time so the scheduled processing timer can't be
              * mod'd to a past virtual time, which would fire immediately and
@@ -494,15 +513,18 @@ void wwt_sync_check(){
                             ? qatomic_read(&wwt_engine->engine->cleanup_sent)
                             : qatomic_read(&wwt_engine->engine->cleanup_received);
         if (may_stop){
+            PDES_VLOG("WWT: exit handshake complete (master=%d), terminating.\n", wwt_engine->engine->master);
 #ifdef CONFIG_LIBQFLEX
             if (flexus_api.stop != NULL){
                 /* terminateSimulation writes all.measurement.end.log then exit(0)s — does not return. */
                 flexus_api.stop();
             }
 #endif
-            /* Belt-and-suspenders if libqflex is off or flexus_api.stop returned. */
+            /* FW build (no libqflex): no Flexus to exit us. Tear down the engine and exit(0) so the
+             * final coordinated checkpoint we just wrote is the last thing on disk — this replaces the
+             * WormCache plugin's old premature exit(0) that dropped the last snapshot (999 vs 1000). */
             pdes_engine_destroy(wwt_engine->engine);
-            return; /* unreachable */
+            exit(0);
         }
         waiting = is_waiting_for_quanta(wwt_engine);
     }
@@ -520,6 +542,7 @@ void wwt_sync_check(){
         // TODO Add race condition lock so double checkpoint never happens (reason we double check needs_to_checkpoint)
         bool monitor_virtual_time_drift = wwt_engine->should_sync && (!wwt_engine->engine->skip_boundry_check_after_checkpoint);
         wwt_engine->engine->skip_boundry_check_after_checkpoint = false;
+        monitor_virtual_time_drift = true; // TODO remove the above and always check later
         if (monitor_virtual_time_drift){
             if (wwt_engine->current_quantum_round > 4){
                 int64_t universal_time = get_universal_virtual_time(wwt_engine->engine);

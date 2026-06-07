@@ -79,6 +79,7 @@ PDESEngine *pdes_engine_create(
     engine->cleanup_received = false;
     engine->ready_sent = false;
     engine->pending_ckp_init = false;
+    engine->fw_exit_after_checkpoint = false;
 
 
 

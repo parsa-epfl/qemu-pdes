@@ -2,6 +2,7 @@
 #include "net/pdes-checkpoint.h"
 #include "qemu/queue.h"
 #include "qemu/timer.h"
+#include "qemu/atomic.h"
 
 // TODO: the in-flight machinery below (pdes_inflight_*) is vestigial — pdes_inflight_add is disabled
 // and nothing is ever in flight across a quantum-aligned checkpoint, so it only ever writes/reads
@@ -302,6 +303,15 @@ void create_checkpoint_bh(bool exit_after){
     qemu_bh_delete(wwt_engine->engine->boundry_checkpoint_bh);
     wwt_engine->engine->boundry_checkpoint_bh = NULL;
     wwt_engine->engine->skip_boundry_check_after_checkpoint = true;
+
+    // FW periodic-snapshot run done: the final coordinated checkpoint is now on disk. Join the exit
+    // handshake (set self_ready) instead of letting the WormCache plugin exit(0) prematurely — that
+    // premature exit dropped the last snapshot (999 vs 1000). Master then broadcasts CTRL_CLEANUP once
+    // the peer is READY, and both terminate together in wwt_sync_check's may_stop.
+    if (wwt_engine->engine->fw_exit_after_checkpoint){
+        printf("FW exit: final coordinated checkpoint written, joining exit handshake.\n");
+        qatomic_set(&wwt_engine->engine->self_ready, true);
+    }
 
     // TODO make this check more modular (also maybe move verify function to here?)
     // If checkpoint name is init_warmed, destroy engine and stop simulation
