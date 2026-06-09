@@ -109,7 +109,8 @@ PDESWWT *pdes_engine_wwt_create(
     int64_t latencyns,
     PDESFinalRecvCallback cb,
     void *opaque,
-    bool master
+    bool master,
+    bool no_flexus
 ){
 
     assert(singleton_wwt_engine == NULL && "Singleton wwt engine already created");
@@ -135,7 +136,8 @@ PDESWWT *pdes_engine_wwt_create(
         is_waiting_for_quanta,
         wwt,
         time_to_setup,
-        master
+        master,
+        no_flexus
     );
 
 

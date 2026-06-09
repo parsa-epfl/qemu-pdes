@@ -41,7 +41,8 @@ PDESEngine *pdes_engine_create(
     PauseStatusCallBack pause_status_cb,
     void *pause_status_opaque,
     int64_t first_sync_virtual_time,
-    bool master
+    bool master,
+    bool no_flexus
 ) {
     // Show error if singleton was created before
     assert(singleton_engine == NULL && "Singleton engine already created");
@@ -73,7 +74,10 @@ PDESEngine *pdes_engine_create(
     engine->notified_neighbors = false;
     engine->boundry_checkpoint_bh = NULL;
     engine->skip_boundry_check_after_checkpoint = false;
-    engine->self_ready = false;
+    engine->no_flexus = no_flexus;
+    // A no-Flexus phantom node is ready to exit from the start (it does no measurement); nothing
+    // would ever call can_stop to set this otherwise, so seed it here.
+    engine->self_ready = no_flexus;
     engine->ready_peers = 0;
     engine->cleanup_sent = false;
     engine->cleanup_received = false;

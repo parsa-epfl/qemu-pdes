@@ -49,7 +49,8 @@ int net_init_pdes(const Netdev *netdev, const char *name, NetClientState *peer, 
     NetClientState *nc = qemu_new_net_client(&net_pdes_info, peer, "pdes", name);
     PDESNetState *s = DO_UPCAST(PDESNetState, nc, nc);
     
-    s->engine = pdes_engine_wwt_create(pdes_opts->shm_send, pdes_opts->shm_recv, pdes_opts->sync, pdes_opts->latencyns, pdes_recv_callback, nc, pdes_opts->master);
+    bool no_flexus = pdes_opts->has_phantom && pdes_opts->phantom;
+    s->engine = pdes_engine_wwt_create(pdes_opts->shm_send, pdes_opts->shm_recv, pdes_opts->sync, pdes_opts->latencyns, pdes_recv_callback, nc, pdes_opts->master, no_flexus);
 
 
 

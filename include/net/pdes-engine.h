@@ -85,6 +85,13 @@ struct PDESEngine {
     bool cleanup_received;
     bool ready_sent;   // peer once-latch for CTRL_READY (main thread)
 
+    // Fully-parallel "phantom" node: a peer running plain parallel qemu with NO Flexus (a node
+    // simulated as phantom-only in the timing phase). Nothing polls can_stop, so self_ready would
+    // never be set and the master would wait forever for its CTRL_READY. When true, the engine is
+    // self_ready from creation: it announces CTRL_READY immediately, the master sends CTRL_CLEANUP
+    // once ITS Flexus is done, and the phantom exits via wwt_sync_check's no-libqflex path.
+    bool no_flexus;
+
     // Control signals queued to ride the next sync (see CTRL_* in pdes-communicator.h). Some are set
     // from the Flexus thread (can_stop) and consumed on the main thread (send_sync) — accessed via qatomic.
     // "ckp_init" = checkpoint *initiate* (peer->master "I'm ready"), general to any master-coordinated
@@ -109,7 +116,8 @@ PDESEngine *pdes_engine_create(
     PauseStatusCallBack pause_status_cb,
     void *pause_status_opaque,
     int64_t first_sync_virtual_time,
-    bool master
+    bool master,
+    bool no_flexus
 );
 void pdes_engine_destroy(PDESEngine *engine);
 int pdes_engine_send(PDESEngine *engine, Message *msg);
@@ -164,9 +172,10 @@ PDESWWT *pdes_engine_wwt_create(
     const char *shm_recv,
     bool sync,
     int64_t latencyns,
-    PDESFinalRecvCallback cb, 
+    PDESFinalRecvCallback cb,
     void *opaque,
-    bool master
+    bool master,
+    bool no_flexus
 );
 void setup_wwt(PDESWWT *wwt_engine);
 void send_sync(PDESWWT *wwt_engine);
