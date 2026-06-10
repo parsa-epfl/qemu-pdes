@@ -42,7 +42,7 @@ PDESEngine *pdes_engine_create(
     void *pause_status_opaque,
     int64_t first_sync_virtual_time,
     bool master,
-    bool no_flexus
+    bool phantom
 ) {
     // Show error if singleton was created before
     assert(singleton_engine == NULL && "Singleton engine already created");
@@ -74,10 +74,14 @@ PDESEngine *pdes_engine_create(
     engine->notified_neighbors = false;
     engine->boundry_checkpoint_bh = NULL;
     engine->skip_boundry_check_after_checkpoint = false;
-    engine->no_flexus = no_flexus;
-    // A no-Flexus phantom node is ready to exit from the start (it does no measurement); nothing
-    // would ever call can_stop to set this otherwise, so seed it here.
-    engine->self_ready = no_flexus;
+    engine->phantom = phantom;
+    // A phantom node produces no measurement output, so it's ready to exit from the start — seed
+    // self_ready here. It then advertises CTRL_READY immediately and rides the master's CTRL_CLEANUP
+    // (broadcast only after the MASTER finishes its own measurement/checkpoint), so the master never
+    // blocks on it. Harmless in every phase: in init/FW the phantom has written its quantum-committed
+    // checkpoint by the time CLEANUP arrives; in uniform timing its libphantomkraken keeps advancing
+    // all cores at the estimated IPC right up to terminate, so it serves the full window first.
+    engine->self_ready = phantom;
     engine->ready_peers = 0;
     engine->cleanup_sent = false;
     engine->cleanup_received = false;
@@ -178,6 +182,13 @@ void set_checkpoint_values_for_master(const char *snapshot_name){
     // the next barrier message — the round of that sync is the round both nodes checkpoint at.
     snprintf(engine->checkpoint_name, sizeof(engine->checkpoint_name), "%s", snapshot_name);
     printf("Setting checkpoint values for master, snapshot name: %s, format: %d\n", engine->checkpoint_name, engine->checkpoint_format);
+    // init_warmed is the last coordinated checkpoint of the init phase: flag it final so CTRL_CKP_FINAL
+    // rides the request. Every node (master + peers) then joins the CTRL_READY/CTRL_CLEANUP exit
+    // handshake after writing it, instead of the master destroying the engine and exiting while the
+    // peers block in sync and get SIGKILLed. A phantom peer is already self_ready (seeded at creation).
+    if (strcmp(snapshot_name, "init_warmed") == 0){
+        engine->fw_exit_after_checkpoint = true;
+    }
     // For now skipping
 }
 void process_message(PDESEngine *engine, Message *msg) {

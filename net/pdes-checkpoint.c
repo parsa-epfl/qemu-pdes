@@ -314,8 +314,13 @@ void create_checkpoint_bh(bool exit_after){
     }
 
     // TODO make this check more modular (also maybe move verify function to here?)
-    // If checkpoint name is init_warmed, destroy engine and stop simulation
-    if (strcmp(wwt_engine->engine->checkpoint_name, "init_warmed") == 0 && wwt_engine->engine->master){
+    // If checkpoint name is init_warmed, the master used to destroy the engine and exit immediately
+    // here — leaving peers blocked in sync until they were SIGKILLed. With fw_exit_after_checkpoint set
+    // for init_warmed, the master instead joins the CTRL_READY/CTRL_CLEANUP handshake (self_ready was
+    // set above) and terminates together with the peers in wwt_sync_check. Keep the old immediate-exit
+    // path only when the handshake is NOT in play.
+    if (strcmp(wwt_engine->engine->checkpoint_name, "init_warmed") == 0 && wwt_engine->engine->master
+            && !wwt_engine->engine->fw_exit_after_checkpoint){
         printf("Checkpoint name is init_warmed, destroying engine and stopping simulation.\n");
         pdes_engine_destroy(wwt_engine->engine);
     }

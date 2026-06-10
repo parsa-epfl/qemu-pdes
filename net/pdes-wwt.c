@@ -110,7 +110,7 @@ PDESWWT *pdes_engine_wwt_create(
     PDESFinalRecvCallback cb,
     void *opaque,
     bool master,
-    bool no_flexus
+    bool phantom
 ){
 
     assert(singleton_wwt_engine == NULL && "Singleton wwt engine already created");
@@ -137,7 +137,7 @@ PDESWWT *pdes_engine_wwt_create(
         wwt,
         time_to_setup,
         master,
-        no_flexus
+        phantom
     );
 
 
@@ -365,8 +365,10 @@ void wwt_recivied_callback(void *opaque, Message *msg){
             snprintf(engine->checkpoint_name, sizeof(engine->checkpoint_name), "%s", (const char *)(msg->data + off));
             // printf("[CKPT] adopted checkpoint via sync flag: round=%lu name=%s\n", msg_round, engine->checkpoint_name);
             if (ctrl & CTRL_CKP_FINAL){
-                engine->fw_exit_after_checkpoint = true;   // exit after this (final FW) checkpoint lands
+                engine->fw_exit_after_checkpoint = true;   // exit after this (final FW/init) checkpoint lands
                 PDES_VLOG("WWT: adopted CTRL_CKP_FINAL; will exit after checkpoint round %lu.\n", msg_round);
+                // A phantom peer is already self_ready (seeded at creation), so no special-casing here:
+                // it has been advertising CTRL_READY since startup and will exit on the master's CLEANUP.
             }
         }
 

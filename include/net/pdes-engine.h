@@ -85,12 +85,14 @@ struct PDESEngine {
     bool cleanup_received;
     bool ready_sent;   // peer once-latch for CTRL_READY (main thread)
 
-    // Fully-parallel "phantom" node: a peer running plain parallel qemu with NO Flexus (a node
-    // simulated as phantom-only in the timing phase). Nothing polls can_stop, so self_ready would
-    // never be set and the master would wait forever for its CTRL_READY. When true, the engine is
-    // self_ready from creation: it announces CTRL_READY immediately, the master sends CTRL_CLEANUP
-    // once ITS Flexus is done, and the phantom exits via wwt_sync_check's no-libqflex path.
-    bool no_flexus;
+    // Phantom node = a node that produces no measurement output. It seeds self_ready at creation so it
+    // announces CTRL_READY immediately and then just rides the master's CTRL_CLEANUP, instead of exiting
+    // on a budget of its own — so the master never blocks waiting for it. The early READY is harmless:
+    // the master broadcasts CLEANUP only after IT finishes its own measurement/checkpoint, by which point
+    // the phantom has done its job (in init/FW it has written its quantum-committed checkpoint; in timing
+    // its libphantomkraken kept advancing all cores at the estimated IPC the whole window). Set for every
+    // phantom node in every phase (the `all_phantom_cores` condition in commands/config.py setup_nic_args).
+    bool phantom;
 
     // Control signals queued to ride the next sync (see CTRL_* in pdes-communicator.h). Some are set
     // from the Flexus thread (can_stop) and consumed on the main thread (send_sync) — accessed via qatomic.
@@ -117,7 +119,7 @@ PDESEngine *pdes_engine_create(
     void *pause_status_opaque,
     int64_t first_sync_virtual_time,
     bool master,
-    bool no_flexus
+    bool phantom
 );
 void pdes_engine_destroy(PDESEngine *engine);
 int pdes_engine_send(PDESEngine *engine, Message *msg);
@@ -175,7 +177,7 @@ PDESWWT *pdes_engine_wwt_create(
     PDESFinalRecvCallback cb,
     void *opaque,
     bool master,
-    bool no_flexus
+    bool phantom
 );
 void setup_wwt(PDESWWT *wwt_engine);
 void send_sync(PDESWWT *wwt_engine);

@@ -49,8 +49,11 @@ int net_init_pdes(const Netdev *netdev, const char *name, NetClientState *peer, 
     NetClientState *nc = qemu_new_net_client(&net_pdes_info, peer, "pdes", name);
     PDESNetState *s = DO_UPCAST(PDESNetState, nc, nc);
     
-    bool no_flexus = pdes_opts->has_phantom && pdes_opts->phantom;
-    s->engine = pdes_engine_wwt_create(pdes_opts->shm_send, pdes_opts->shm_recv, pdes_opts->sync, pdes_opts->latencyns, pdes_recv_callback, nc, pdes_opts->master, no_flexus);
+    // phantom = a phantom node (no measurement output). It seeds self_ready at creation and rides the
+    // master's CLEANUP instead of exiting on its own budget, so the master never blocks on it. Set for
+    // every phantom node in every phase (commands/config.py setup_nic_args).
+    bool phantom = pdes_opts->has_phantom && pdes_opts->phantom;
+    s->engine = pdes_engine_wwt_create(pdes_opts->shm_send, pdes_opts->shm_recv, pdes_opts->sync, pdes_opts->latencyns, pdes_recv_callback, nc, pdes_opts->master, phantom);
 
 
 
