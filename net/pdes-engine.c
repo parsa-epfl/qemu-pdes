@@ -265,7 +265,7 @@ void schedule_poll(void *opaque){
  * gates in dynamic_barrier.c (MTTCG) and tcg-accel-ops-rr.c (RR) read this. */
 void pdes_pause(void *opaque){
     PDESEngine *engine = opaque;
-    engine->paused = true;
+    qatomic_set(&engine->paused, true);
 #ifdef CONFIG_LIBQFLEX
     if (flexus_api.pause != NULL){
         flexus_api.pause();
@@ -285,7 +285,7 @@ void pdes_play(void *opaque){
         assert(false && "Flexus resume API is not implemented, but stop API is implemented, this should not happen as both should be implemented together");
     }
 #endif
-    engine->paused = false;
+    qatomic_set(&engine->paused, false);
 }
 
 

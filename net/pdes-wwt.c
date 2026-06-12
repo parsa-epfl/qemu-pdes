@@ -543,6 +543,11 @@ void wwt_sync_check(){
             exit(0);
         }
         waiting = is_waiting_for_quanta(wwt_engine);
+        if (waiting) {
+            // Free the host core between polls — vCPUs are parked at the barrier during this
+            // window, and 50 µs is noise against any real peer wait.
+            g_usleep(50);
+        }
     }
     // printf("WWT: Finished waiting for quanta for round %lu at virtual time %lu ns, proceeding with quantum sync.\n", wwt_engine->current_quantum_round, current_time);
     if (waiting){
