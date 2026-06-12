@@ -51,7 +51,9 @@ int net_init_pdes(const Netdev *netdev, const char *name, NetClientState *peer, 
     
     // phantom = a phantom node (no measurement output). It seeds self_ready at creation and rides the
     // master's CLEANUP instead of exiting on its own budget, so the master never blocks on it. Set for
-    // every phantom node in every phase (commands/config.py setup_nic_args).
+    // every phantom node in every phase (commands/config.py setup_nic_args). An init/FW phantom also writes
+    // a checkpoint; that is never dropped because the master's checkpoint-exit gate keys on CTRL_CKP_DONE
+    // (post-save), not on this early CTRL_READY.
     bool phantom = pdes_opts->has_phantom && pdes_opts->phantom;
     s->engine = pdes_engine_wwt_create(pdes_opts->shm_send, pdes_opts->shm_recv, pdes_opts->sync, pdes_opts->latencyns, pdes_recv_callback, nc, pdes_opts->master, phantom);
 

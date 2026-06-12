@@ -75,12 +75,9 @@ PDESEngine *pdes_engine_create(
     engine->boundry_checkpoint_bh = NULL;
     engine->skip_boundry_check_after_checkpoint = false;
     engine->phantom = phantom;
-    // A phantom node produces no measurement output, so it's ready to exit from the start — seed
-    // self_ready here. It then advertises CTRL_READY immediately and rides the master's CTRL_CLEANUP
-    // (broadcast only after the MASTER finishes its own measurement/checkpoint), so the master never
-    // blocks on it. Harmless in every phase: in init/FW the phantom has written its quantum-committed
-    // checkpoint by the time CLEANUP arrives; in uniform timing its libphantomkraken keeps advancing
-    // all cores at the estimated IPC right up to terminate, so it serves the full window first.
+    // A phantom is always ready to exit (no measurement output): seed self_ready so it just rides the
+    // master's CTRL_CLEANUP. Safe even when it checkpoints — the master's release gate waits on the
+    // post-save CTRL_CKP_DONE, not on this flag.
     engine->self_ready = phantom;
     engine->ready_peers = 0;
     engine->cleanup_sent = false;
@@ -88,6 +85,8 @@ PDESEngine *pdes_engine_create(
     engine->ready_sent = false;
     engine->pending_ckp_init = false;
     engine->fw_exit_after_checkpoint = false;
+    engine->pending_ckp_done = false;
+    engine->ckp_done_peers = 0;
 
 
 
@@ -121,6 +120,12 @@ void destroy_strategy(){
 void pdes_engine_destroy(PDESEngine *engine) {
     // By the time we tear down, our exit signal (READY as a peer, or CLEANUP as the master) has
     // already gone out on a sync — nothing left to announce here.
+    // Sanity count: nonzero is NORMAL at a timing-window end (the window terminates mid-stream);
+    // it is NOT a checkpoint drop — those are persisted by pdes_drain before the save.
+    if (pdes_inflight_count() > 0) {
+        printf("[CKPT-INFLIGHT] exiting with %d undelivered scheduled messages (expected at window end)\n",
+               pdes_inflight_count());
+    }
     if(engine->needs_to_checkpoint){
         // Create bh
         if (!engine->boundry_checkpoint_bh){
@@ -183,9 +188,10 @@ void set_checkpoint_values_for_master(const char *snapshot_name){
     snprintf(engine->checkpoint_name, sizeof(engine->checkpoint_name), "%s", snapshot_name);
     printf("Setting checkpoint values for master, snapshot name: %s, format: %d\n", engine->checkpoint_name, engine->checkpoint_format);
     // init_warmed is the last coordinated checkpoint of the init phase: flag it final so CTRL_CKP_FINAL
-    // rides the request. Every node (master + peers) then joins the CTRL_READY/CTRL_CLEANUP exit
-    // handshake after writing it, instead of the master destroying the engine and exiting while the
-    // peers block in sync and get SIGKILLed. A phantom peer is already self_ready (seeded at creation).
+    // rides the request. Every node (master + peers, including a phantom peer) then writes it and joins the
+    // exit handshake, instead of the master destroying the engine and exiting while peers block in sync and
+    // get SIGKILLed. The master broadcasts CTRL_CLEANUP only once it has every node's CTRL_CKP_DONE
+    // (set post-save), so no node is torn down mid-write.
     if (strcmp(snapshot_name, "init_warmed") == 0){
         engine->fw_exit_after_checkpoint = true;
     }
@@ -214,6 +220,9 @@ void process_message(PDESEngine *engine, Message *msg) {
         }
         if ((ctrl & CTRL_READY) && engine->master){
             qatomic_inc(&engine->ready_peers);   // a peer's Flexus is ready to stop
+        }
+        if ((ctrl & CTRL_CKP_DONE) && engine->master){
+            qatomic_inc(&engine->ckp_done_peers);   // a peer's coordinated checkpoint is on disk
         }
         if (ctrl & CTRL_CLEANUP){
             qatomic_set(&engine->cleanup_received, true);   // master says: terminate
@@ -281,14 +290,32 @@ void pdes_play(void *opaque){
 
 
 
-// TODO: vestigial. With all messages delivered by the quantum barrier and checkpoints landing only at
-// a barrier, nothing is ever in flight across a snapshot — pdes_inflight_add is disabled, so this only
-// writes an empty JSON. Remove pdes_drain + its savevm.c calls + the whole in-flight machinery below.
+// Persist the link's in-flight traffic across the snapshot. The barrier guarantees nothing with
+// delivery-ts <= the boundary is pending, but messages sent DURING the checkpoint round deliver in the
+// next round (ts=send+latency) — those are real wire state and must survive the cut. Drain the recv
+// ring first so sync=false saves (boot) don't leave unconsumed messages behind either.
 int pdes_drain(PDESEngine *engine, char * snapshot_name, SnapshotFormat format) {
 #ifdef CONFIG_LIBQFLEX
     assert(format == SNAPSHOT_FORMAT_EXTERNAL_INCREMENTAL_BASE && "qemu fork: pdes_drain only supports SNAPSHOT_FORMAT_EXTERNAL_INCREMENTAL_BASE");
 #endif
-    pdes_inflight_save_json(snapshot_name);
+    pdes_engine_poll(engine);   // loops until the ring is empty; residue becomes scheduled deliveries
+    if (engine->deferred_normal && !g_queue_is_empty(engine->deferred_normal)) {
+        // These are NOT persisted — saving now would silently drop them. Fail the savevm loudly.
+        printf("[CKPT-INFLIGHT] %s: ERROR %u messages parked in deferred_normal at save (pre-first-sync gate) — aborting snapshot to avoid dropping them\n",
+               snapshot_name, g_queue_get_length(engine->deferred_normal));
+        return -1;
+    }
+    int count = pdes_inflight_count();
+    if (count > 0) {
+        printf("[CKPT-INFLIGHT] %s: saving %d undelivered messages\n", snapshot_name, count);
+        return pdes_inflight_save_json(snapshot_name);
+    }
+    // Remove any stale json from a previous run of this snapshot name, so a re-run can never
+    // restore another run's in-flight traffic.
+    char *stale = get_json_file_name(snapshot_name);
+    unlink(stale);
+    g_free(stale);
+    printf("[CKPT-INFLIGHT] %s: none in flight\n", snapshot_name);
     return 0;
 }
 

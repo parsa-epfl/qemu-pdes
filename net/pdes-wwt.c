@@ -263,19 +263,29 @@ void send_sync(PDESWWT *wwt_engine){
     }
     // Checkpoint-init: peer->master "ready to checkpoint", rides the sync once.
     if (qatomic_xchg(&engine->pending_ckp_init, false)) ctrl |= CTRL_CKP_INIT;
-    // Exit handshake: peer announces readiness once; master broadcasts cleanup once it and all peers are
-    // ready. self_ready is set by can_stop on the Flexus thread (qatomic).
+    // Checkpoint-done report: peer->master "my checkpoint is on disk". Set ONLY in create_checkpoint_bh
+    // after save_snapshot returns, so it can never ride a sync before the write.
+    if (qatomic_xchg(&engine->pending_ckp_done, false)) ctrl |= CTRL_CKP_DONE;
+    // A non-master only announces it is done (CTRL_READY in timing, CTRL_CKP_DONE post-save in a
+    // checkpoint) and otherwise waits for the master's CLEANUP — it never looks at peers. The master
+    // alone decides: once its own work is done (self_ready) and it has counted a done-report from every
+    // peer, it sends the one CLEANUP flag.
     bool sending_cleanup = false;
     if (!engine->master){
         if (qatomic_read(&engine->self_ready) && !engine->ready_sent){
             ctrl |= CTRL_READY;
             engine->ready_sent = true;
         }
-    } else if (qatomic_read(&engine->self_ready)
-               && qatomic_read(&engine->ready_peers) >= wwt_engine->number_of_neighbors
-               && !qatomic_read(&engine->cleanup_sent)){
-        ctrl |= CTRL_CLEANUP;
-        sending_cleanup = true;
+    } else {
+        int peers_done = engine->fw_exit_after_checkpoint
+            ? qatomic_read(&engine->ckp_done_peers)
+            : qatomic_read(&engine->ready_peers);
+        if (qatomic_read(&engine->self_ready)
+                && peers_done >= wwt_engine->number_of_neighbors
+                && !qatomic_read(&engine->cleanup_sent)){
+            ctrl |= CTRL_CLEANUP;
+            sending_cleanup = true;
+        }
     }
     buf[sizeof(round)] = ctrl;
     Message sync_msg = create_message(buf, off, MSG_TYPE_SYNC, get_current_virtual_for_sync_message(engine));
@@ -367,8 +377,9 @@ void wwt_recivied_callback(void *opaque, Message *msg){
             if (ctrl & CTRL_CKP_FINAL){
                 engine->fw_exit_after_checkpoint = true;   // exit after this (final FW/init) checkpoint lands
                 PDES_VLOG("WWT: adopted CTRL_CKP_FINAL; will exit after checkpoint round %lu.\n", msg_round);
-                // A phantom peer is already self_ready (seeded at creation), so no special-casing here:
-                // it has been advertising CTRL_READY since startup and will exit on the master's CLEANUP.
+                // No phantom special-casing: like any peer (phantom or not) this node sends CTRL_CKP_DONE in
+                // create_checkpoint_bh AFTER writing this checkpoint, and the master's checkpoint-exit gate
+                // waits for it before CLEANUP — so this savevm is never cut short, whatever self_ready was.
             }
         }
 
@@ -426,8 +437,9 @@ void wwt_recivied_callback(void *opaque, Message *msg){
         // calculate time diffrence in seconds (not ns) and print in how many seconds the message will be processed
         // printf("Message will be processed in %.3f seconds at virtual time %lu ns (current virtual time is %lu ns, translated message time is %lu ns).\n", time_diff_sec, processing_time, current_virtual_time_translated, translated_time);
         timer_mod(ctx->one_time_poll_timer, raw_processing_time);
-        // TODO remove inflight things
-        // pdes_inflight_add(msg, raw_processing_time);
+        // Track until delivered: messages sent during a quantum deliver in the NEXT one (ts=send+latency),
+        // so at a checkpoint barrier this set is the link's in-flight traffic — pdes_drain persists it.
+        pdes_inflight_add(msg, raw_processing_time);
 
         // printf("WWT_RECV: msg_ts=%ld universal_now=%ld raw_processing=%ld FST=%ld\n",
         // translated_time, current_virtual_time_translated, raw_processing_time,

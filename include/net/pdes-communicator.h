@@ -22,6 +22,7 @@ typedef struct PDESCommunicator PDESCommunicator;
 #define CTRL_READY        0x04   // peer->master: this node's Flexus is ready to stop
 #define CTRL_CLEANUP      0x08   // master->peer: everyone is ready, terminate
 #define CTRL_CKP_FINAL    0x10   // master->peer: this checkpoint is the last FW snapshot; exit after writing it
+#define CTRL_CKP_DONE     0x20   // peer->master: my coordinated checkpoint is on disk (save_snapshot returned)
 
 typedef struct {
     uint64_t ts_ns;       /* timestamp in nanoseconds */

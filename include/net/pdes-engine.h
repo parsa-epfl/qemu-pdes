@@ -85,13 +85,15 @@ struct PDESEngine {
     bool cleanup_received;
     bool ready_sent;   // peer once-latch for CTRL_READY (main thread)
 
-    // Phantom node = a node that produces no measurement output. It seeds self_ready at creation so it
-    // announces CTRL_READY immediately and then just rides the master's CTRL_CLEANUP, instead of exiting
-    // on a budget of its own — so the master never blocks waiting for it. The early READY is harmless:
-    // the master broadcasts CLEANUP only after IT finishes its own measurement/checkpoint, by which point
-    // the phantom has done its job (in init/FW it has written its quantum-committed checkpoint; in timing
-    // its libphantomkraken kept advancing all cores at the estimated IPC the whole window). Set for every
-    // phantom node in every phase (the `all_phantom_cores` condition in commands/config.py setup_nic_args).
+    // Peer's checkpoint-done report-back, set ONLY in create_checkpoint_bh after save_snapshot returns
+    // (so it can never be signalled early). pending_ckp_done = peer once-latch -> CTRL_CKP_DONE on its
+    // next sync; ckp_done_peers = master's count of those. The master's own "done" reuses self_ready.
+    bool pending_ckp_done;
+    int  ckp_done_peers;
+
+    // A phantom (no measurement output) seeds self_ready at creation: always ready to exit, it just rides
+    // the master's CTRL_CLEANUP. Safe even when it writes a checkpoint, because the master's release gate
+    // keys on the post-save CTRL_CKP_DONE, not on this ready flag.
     bool phantom;
 
     // Control signals queued to ride the next sync (see CTRL_* in pdes-communicator.h). Some are set
