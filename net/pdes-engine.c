@@ -118,6 +118,15 @@ void destroy_strategy(){
     }
 }
 void pdes_engine_destroy(PDESEngine *engine) {
+    // Additive, log-only: report cumulative guest data moved over the PDES wire (bytes + #chunks).
+    // Gated — only when QFLEX_MEASURE_DATA_MOVEMENT is set (generate-test-communication); off normally.
+    if (pdes_data_measure_enabled()) {
+        uint64_t bs = 0, ms = 0, br = 0, mr = 0;
+        pdes_comm_get_data_stats(&bs, &ms, &br, &mr);
+        printf("[PDES-WIRE] data_bytes_sent=%llu data_msgs_sent=%llu data_bytes_recv=%llu data_msgs_recv=%llu\n",
+               (unsigned long long)bs, (unsigned long long)ms, (unsigned long long)br, (unsigned long long)mr);
+        fflush(stdout);
+    }
     // By the time we tear down, our exit signal (READY as a peer, or CLEANUP as the master) has
     // already gone out on a sync — nothing left to announce here.
     // Sanity count: nonzero is NORMAL at a timing-window end (the window terminates mid-stream);

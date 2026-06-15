@@ -38,5 +38,10 @@ void pdes_comm_destroy(PDESCommunicator *comm);
 Message create_message(const uint8_t *data, size_t len, uint8_t type, uint64_t ts_ns);
 int pdes_comm_send(PDESCommunicator *comm, Message *msg);
 int pdes_comm_recv(PDESCommunicator *comm, Message *msg);
+/* Additive, log-only: cumulative NORMAL (guest data) bytes + message count moved over the wire. */
+void pdes_comm_get_data_stats(uint64_t *bytes_sent, uint64_t *msgs_sent,
+                              uint64_t *bytes_recv, uint64_t *msgs_recv);
+/* 1 iff QFLEX_MEASURE_DATA_MOVEMENT is set — gates the data counters + [PDES-WIRE] report (off normally). */
+int pdes_data_measure_enabled(void);
 
 #endif
