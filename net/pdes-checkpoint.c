@@ -2,7 +2,12 @@
 #include "net/pdes-checkpoint.h"
 #include "qemu/queue.h"
 #include "qemu/timer.h"
+#include "qemu/atomic.h"
 
+// In-flight tracking: messages sent during the checkpoint round deliver in the NEXT round
+// (ts = send + latency), so they are genuinely in flight at the barrier. pdes_inflight_add
+// (scheduling site) / pdes_inflight_remove (delivery) keep this list ≡ the undelivered set;
+// pdes_drain persists it at savevm and pdes_inflight_restore_and_schedule replays it at loadvm.
 typedef struct ScheduledMessage {
     Message msg;
     int64_t scheduled_time_ns;
@@ -91,7 +96,8 @@ int pdes_inflight_save_json(const char *checkpoint_name) {
         return -1;
     }
 
-    fprintf(fp, "{\n  \"inflight_messages\": [\n");
+    // count first so the loader can verify it parsed every entry (hand-rolled parser).
+    fprintf(fp, "{\n  \"count\": %d,\n  \"inflight_messages\": [\n", pending_count);
 
     ScheduledMessage *entry;
     int i = 0;
@@ -172,11 +178,12 @@ InflightMessageArray *pdes_inflight_load_json(const char *filename) {
         ptr += strlen("\"data\": [");
 
         for (uint32_t j = 0; j < len; j++) {
-            unsigned int byte;
-            sscanf(ptr, "%u", &byte);
-            messages[count].data[j] = (uint8_t)byte;
-            ptr = strchr(ptr, ',');
-            if (ptr) ptr++;
+            // strtoul advances past the parsed number itself — the last byte of the last
+            // message has no trailing comma, and strchr(NULL-from-no-comma) was a segfault.
+            char *end;
+            messages[count].data[j] = (uint8_t)strtoul(ptr, &end, 10);
+            ptr = end;
+            while (*ptr == ',' || *ptr == ' ' || *ptr == '\n') ptr++;
         }
 
         count++;
@@ -192,28 +199,76 @@ InflightMessageArray *pdes_inflight_load_json(const char *filename) {
     return result;
 }
 
+// Parse the "count" header pdes_inflight_save_json writes. -1 = header absent (old file: skip check).
+static int pdes_inflight_file_count(const char *filename) {
+    FILE *fp = fopen(filename, "r");
+    if (!fp) return -1;
+    char buf[128];
+    int count = -1;
+    while (fgets(buf, sizeof(buf), fp)) {
+        if (sscanf(buf, " \"count\": %d", &count) == 1) break;
+        if (strstr(buf, "inflight_messages")) break;   // header section over
+    }
+    fclose(fp);
+    return count;
+}
+
 int pdes_inflight_restore_and_schedule(const char *checkpoint_name, PDESFinalRecvCallback recv_cb, void *recv_opaque) {
     char *filename = get_json_file_name(checkpoint_name);
     InflightMessageArray *arr = pdes_inflight_load_json(filename);
     if (!arr) {
-        return -1;
+        // pdes_drain writes the json only when something was in flight — a missing file means 0.
+        printf("[CKPT-INFLIGHT] %s: no in-flight file (0 restored)\n", checkpoint_name);
+        g_free(filename);
+        return 0;
     }
 
+    // Integrity: the file's count header must match what the parser extracted, and only NORMAL
+    // messages are ever saved — anything else means a truncated/corrupt file. Fail the load.
+    int expected = pdes_inflight_file_count(filename);
+    if (expected >= 0 && expected != arr->count) {
+        printf("[CKPT-INFLIGHT] %s: ERROR file declares %d messages but parser extracted %d — corrupt in-flight file\n",
+               checkpoint_name, expected, arr->count);
+        pdes_inflight_array_free(arr);
+        g_free(filename);
+        return -1;
+    }
+    for (int i = 0; i < arr->count; i++) {
+        if (arr->messages[i].type != MSG_TYPE_NORMAL || arr->messages[i].len == 0 ||
+            arr->messages[i].len > MAX_MSG_SIZE) {
+            printf("[CKPT-INFLIGHT] %s: ERROR message %d invalid (type=%u len=%u) — corrupt in-flight file\n",
+                   checkpoint_name, i, arr->messages[i].type, arr->messages[i].len);
+            pdes_inflight_array_free(arr);
+            g_free(filename);
+            return -1;
+        }
+    }
+
+    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
     for (int i = 0; i < arr->count; i++) {
         MessageReceiveContext *ctx = g_new0(MessageReceiveContext, 1);
         ctx->msg = arr->messages[i];
         ctx->recv_cb = recv_cb;
         ctx->recv_opaque = recv_opaque;
-        ctx->timestamp_ns = arr->scheduled_times[i];
-        ctx->one_time_poll_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, 
+        int64_t ts = arr->scheduled_times[i];
+        // loadvm restores the virtual clock, so saved times should be in the future; clamp (preserving
+        // order via +i) and log if one isn't — sanity signal for a clock/translation mismatch.
+        if (ts <= now) {
+            printf("[CKPT-INFLIGHT] %s: restored message %d has past ts %ld (now %ld), clamping\n",
+                   checkpoint_name, i, ts, now);
+            ts = now + 1 + i;
+        }
+        ctx->timestamp_ns = ts;
+        ctx->one_time_poll_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL,
             (QEMUTimerCB *)process_message_at_virtual_time, ctx);
 
-        timer_mod(ctx->one_time_poll_timer, arr->scheduled_times[i]);
+        timer_mod(ctx->one_time_poll_timer, ts);
 
-        pdes_inflight_add(&arr->messages[i], arr->scheduled_times[i]);
+        pdes_inflight_add(&arr->messages[i], ts);
     }
 
     int count = arr->count;
+    printf("[CKPT-INFLIGHT] %s: restored %d in-flight messages\n", checkpoint_name, count);
     pdes_inflight_array_free(arr);
     g_free(filename);
     return count;
@@ -242,21 +297,12 @@ bool validate_checkpoint(const char **check_point_name){
                 *check_point_name = name + 5;
                 printf("modified checkpoint name for PDESEngine: %s and continuing with checkpointing.\n", *check_point_name);
                 return true;
-            }else if (name != NULL && strcmp(name, "init_warmed") == 0) {
-                printf("!!!!!!!!!!!!!!!! THIS SHOULD NOT BE HAPPENINGING !!!!!!!!!!!!!!!!\n");
-                return false;
-                // TODO expand this to multiple nodes
-                // This is not the master so it can't initiate it, just let master know we are ready
-                printf("Received drain signal but not master, marking engine as done for init.\n");
-                int res = send_initiate_checkpoint_message(engine);
-                assert (res == 0 && "Failed to send checkpoint initiation message to master");
-                printf("Sent checkpoint initiation message to master successfully, waiting for checkpoint initiation signal.\n");
-                return false;
             }else{
-                // We will skip any checkpointing as master decides when to checkpoint, need to return (caused by pdes)
+                // Not master and not a QPDES-tagged (master-initiated) checkpoint: skip — the master
+                // decides when peers checkpoint, via the CTRL_CKP_REQUEST flag on the sync.
                 printf("Skipping snapshot as not master PDESEngine\n");
                 return false;
-            } 
+            }
         }else{
             // Master
             if (name != NULL && strcmp(name, "init_warmed") == 0){
@@ -292,11 +338,12 @@ bool validate_checkpoint(const char **check_point_name){
 void create_checkpoint_bh(bool exit_after){
     PDESWWT *wwt_engine = get_singleton_wwt_engine();
     if (!wwt_engine->engine->needs_to_checkpoint){
+        // printf("[CKPT] create_checkpoint_bh fired but needs_to_checkpoint=false, SKIPPING (master=%d round=%lu)\n",
+        //        wwt_engine->engine->master, wwt_engine->current_quantum_round);
         return;
     }
 
     printf("WWT: Finished waiting for quanta for round %lu, starting checkpoint for this quantum.\n", wwt_engine->current_quantum_round - 1);
-    wwt_engine->engine->checkpoint_in_progress = false;
     printf("WWT: Starting checkpoint for quantum %lu with snapshot name %s and format %d.\n", wwt_engine->current_quantum_round - 1, wwt_engine->engine->checkpoint_name, wwt_engine->engine->checkpoint_format);
     save_snapshot(wwt_engine->engine->checkpoint_name, true, NULL, false, NULL, wwt_engine->engine->checkpoint_format, NULL);
     printf("WWT: Finished checkpoint for quantum %lu, starting next quantum.\n", wwt_engine->current_quantum_round - 1);
@@ -308,9 +355,24 @@ void create_checkpoint_bh(bool exit_after){
     wwt_engine->engine->boundry_checkpoint_bh = NULL;
     wwt_engine->engine->skip_boundry_check_after_checkpoint = true;
 
+    // Exit-checkpoint is on disk: mark this node done so the master can release everyone. The master
+    // sets its own self_ready (the same "I'm done" the timing path uses); a peer latches CTRL_CKP_DONE
+    // for its next sync. The master holds CTRL_CLEANUP until it has heard every peer's done.
+    if (wwt_engine->engine->fw_exit_after_checkpoint){
+        if (wwt_engine->engine->master)
+            qatomic_set(&wwt_engine->engine->self_ready, true);
+        else
+            qatomic_set(&wwt_engine->engine->pending_ckp_done, true);
+    }
+
     // TODO make this check more modular (also maybe move verify function to here?)
-    // If checkpoint name is init_warmed, destroy engine and stop simulation
-    if (strcmp(wwt_engine->engine->checkpoint_name, "init_warmed") == 0 && wwt_engine->engine->master){
+    // If checkpoint name is init_warmed, the master used to destroy the engine and exit immediately
+    // here — leaving peers blocked in sync until they were SIGKILLed. With fw_exit_after_checkpoint set
+    // for init_warmed, the master instead joins the CTRL_READY/CTRL_CLEANUP handshake (self_ready was
+    // set above) and terminates together with the peers in wwt_sync_check. Keep the old immediate-exit
+    // path only when the handshake is NOT in play.
+    if (strcmp(wwt_engine->engine->checkpoint_name, "init_warmed") == 0 && wwt_engine->engine->master
+            && !wwt_engine->engine->fw_exit_after_checkpoint){
         printf("Checkpoint name is init_warmed, destroying engine and stopping simulation.\n");
         pdes_engine_destroy(wwt_engine->engine);
     }

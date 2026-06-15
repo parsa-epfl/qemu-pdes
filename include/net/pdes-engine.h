@@ -26,8 +26,10 @@ struct PDESEngine {
     QEMUTimer *msg_rec_poll_timer;
     QEMUTimer *sync_poll_timer;
     QEMUTimer *setup_poll_timer;
-    bool has_first_sync;
-    bool pair_has_finished;
+    bool has_first_sync;        /* gate: open once our first sync is sent AND peer's received */
+    bool sent_first_sync;       /* our setup_wwt has set first_sync_virtual_time and sent sync */
+    bool received_first_sync;   /* we've received the peer's first sync */
+    GQueue *deferred_normal;    /* NORMAL msgs parked while the gate is shut (Message* copies) */
 
     // Specific to QEMU implications of blocking event queu in case of pause on device and icount TODO generalize
     PauseStatusCallBack pause_status_cb;
@@ -48,9 +50,7 @@ struct PDESEngine {
     int64_t base_time_diff;
 
     // Checkpoint specific
-    int neighbour_drained;
     QEMUTimer *drain_poll_timer;
-    bool checkpoint_in_progress;
     QEMUTimer *checkpoint_initiate_timer;
     QEMUBH *checkpoint_bh;
 
@@ -76,13 +76,38 @@ struct PDESEngine {
     // Special bool: if we checkpointed: since it can move time by qemu for all nodes: don't do boundry check : TODO clean this check up later
     bool skip_boundry_check_after_checkpoint;
 
-    // exit changes
-    bool notified_neighbors_for_exit;
-    int ready_to_exit_neighbors;
-    bool permitted_to_exit;
-    bool ready_to_exit;
-    bool end_message_sent;
-    bool intent_sent;
+    // exit handshake: peer sends CTRL_READY when its Flexus is ready; master broadcasts CTRL_CLEANUP
+    // once it and all peers are ready; each node then terminates on a signal it owns/holds. self_ready
+    // (Flexus thread) / ready_peers / cleanup_sent / cleanup_received are touched cross-thread -> qatomic.
+    bool self_ready;
+    int ready_peers;
+    bool cleanup_sent;
+    bool cleanup_received;
+    bool ready_sent;   // peer once-latch for CTRL_READY (main thread)
+
+    // Peer's checkpoint-done report-back, set ONLY in create_checkpoint_bh after save_snapshot returns
+    // (so it can never be signalled early). pending_ckp_done = peer once-latch -> CTRL_CKP_DONE on its
+    // next sync; ckp_done_peers = master's count of those. The master's own "done" reuses self_ready.
+    bool pending_ckp_done;
+    int  ckp_done_peers;
+
+    // A phantom (no measurement output) seeds self_ready at creation: always ready to exit, it just rides
+    // the master's CTRL_CLEANUP. Safe even when it writes a checkpoint, because the master's release gate
+    // keys on the post-save CTRL_CKP_DONE, not on this ready flag.
+    bool phantom;
+
+    // Control signals queued to ride the next sync (see CTRL_* in pdes-communicator.h). Some are set
+    // from the Flexus thread (can_stop) and consumed on the main thread (send_sync) — accessed via qatomic.
+    // "ckp_init" = checkpoint *initiate* (peer->master "I'm ready"), general to any master-coordinated
+    // checkpoint — NOT init_warmed-specific. The master->peer announcement itself is CTRL_CKP_REQUEST,
+    // which carries an arbitrary snapshot name and works for every master-initiated checkpoint.
+    bool pending_ckp_init;
+
+    // FW (WormCache) exit: set on the master when the plugin has taken its final periodic snapshot
+    // (qemu_plugin_pdes_fw_complete), and on a peer when it adopts CTRL_CKP_FINAL. Once the final
+    // coordinated checkpoint is written (create_checkpoint_bh), the node sets self_ready and joins the
+    // CTRL_READY/CTRL_CLEANUP handshake, so the plugin no longer exit(0)s before that last file lands.
+    bool fw_exit_after_checkpoint;
 };
 
 PDESEngine *pdes_engine_create(
@@ -95,10 +120,10 @@ PDESEngine *pdes_engine_create(
     PauseStatusCallBack pause_status_cb,
     void *pause_status_opaque,
     int64_t first_sync_virtual_time,
-    bool master
+    bool master,
+    bool phantom
 );
 void pdes_engine_destroy(PDESEngine *engine);
-void notify_neighbours_of_end(PDESEngine *engine);
 int pdes_engine_send(PDESEngine *engine, Message *msg);
 void pdes_engine_poll(void *opaque);
 
@@ -151,9 +176,10 @@ PDESWWT *pdes_engine_wwt_create(
     const char *shm_recv,
     bool sync,
     int64_t latencyns,
-    PDESFinalRecvCallback cb, 
+    PDESFinalRecvCallback cb,
     void *opaque,
-    bool master
+    bool master,
+    bool phantom
 );
 void setup_wwt(PDESWWT *wwt_engine);
 void send_sync(PDESWWT *wwt_engine);
@@ -182,19 +208,11 @@ void process_message_at_virtual_time(MessageReceiveContext *opaque);
 
 int64_t get_universal_virtual_time(PDESEngine *engine);
 PDESWWT *get_singleton_wwt_engine();
-int send_initiate_checkpoint_message(PDESEngine *engine);
 void sync_count_increment(GHashTable *table, uint64_t round);
 int sync_count_get(GHashTable *table, uint64_t round);
 void finish_initiate_checkpoint(PDESEngine *engine);
 
 void destroy_strategy();
 bool can_stop(PDESEngine *engine);
-// Internal: emit the deferred END_OF_EMULATION wire message iff Flexus has
-// signalled it wants to exit AND the bilateral INTENT/PERMISSION handshake
-// has completed (permitted_to_exit is true). Idempotent. Called from places
-// that flip permitted_to_exit (master can_stop, follower PERMISSION arm,
-// wwt_sync_check exit handshake) so the END goes out as soon as the gate
-// opens.
-void _send_end_if_handshake_complete(PDESEngine *engine);
 
 #endif

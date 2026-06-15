@@ -41,7 +41,8 @@ PDESEngine *pdes_engine_create(
     PauseStatusCallBack pause_status_cb,
     void *pause_status_opaque,
     int64_t first_sync_virtual_time,
-    bool master
+    bool master,
+    bool phantom
 ) {
     // Show error if singleton was created before
     assert(singleton_engine == NULL && "Singleton engine already created");
@@ -52,8 +53,10 @@ PDESEngine *pdes_engine_create(
     engine->recv_cb = cb;
     engine->recv_opaque = opaque;
     engine->has_first_sync = false;
+    engine->sent_first_sync = false;
+    engine->received_first_sync = false;
+    engine->deferred_normal = g_queue_new();
     engine->waiting_for_quanta = false;
-    engine->pair_has_finished = false;
     engine->base_diff = 0;
     engine->paused = false;
     engine->pause_status_cb = pause_status_cb;
@@ -62,8 +65,6 @@ PDESEngine *pdes_engine_create(
     engine->first_sync_virtual_time = first_sync_virtual_time;
     engine->caclulated_time_diff = false;
     engine->base_time_diff = 0;
-    engine->neighbour_drained = 0;
-    engine->checkpoint_in_progress = false;
 
     engine->master = master;
     engine->init_flag = 0;
@@ -71,14 +72,21 @@ PDESEngine *pdes_engine_create(
     engine->pause_bh = NULL;
     engine->needs_to_checkpoint = false;
     engine->notified_neighbors = false;
-    engine->notified_neighbors_for_exit = false;
     engine->boundry_checkpoint_bh = NULL;
     engine->skip_boundry_check_after_checkpoint = false;
-    engine->ready_to_exit_neighbors = 0;
-    engine->permitted_to_exit = false;
-    engine->ready_to_exit = false;
-    engine->end_message_sent = false;
-    engine->intent_sent = false;
+    engine->phantom = phantom;
+    // A phantom is always ready to exit (no measurement output): seed self_ready so it just rides the
+    // master's CTRL_CLEANUP. Safe even when it checkpoints — the master's release gate waits on the
+    // post-save CTRL_CKP_DONE, not on this flag.
+    engine->self_ready = phantom;
+    engine->ready_peers = 0;
+    engine->cleanup_sent = false;
+    engine->cleanup_received = false;
+    engine->ready_sent = false;
+    engine->pending_ckp_init = false;
+    engine->fw_exit_after_checkpoint = false;
+    engine->pending_ckp_done = false;
+    engine->ckp_done_peers = 0;
 
 
 
@@ -98,25 +106,6 @@ PDESEngine *pdes_engine_create(
 }
 
 
-// Idempotent — emit END once permitted_to_exit is set. Decoupled from
-// notify_neighbours_of_end so we can fire it from the handshake path
-// without waiting for libqflex_stop.
-void _send_end_if_handshake_complete(PDESEngine *engine){
-    /* Both flags are set across threads (main thread on the PERMISSION arm,
-     * Flexus thread in can_stop, main thread in wwt_sync_check master arm)
-     * — read/write atomically so the "send END exactly once after our
-     * permitted_to_exit flips" invariant survives concurrent callers. */
-    if(!qatomic_read(&engine->permitted_to_exit)) return;
-    if(qatomic_xchg(&engine->end_message_sent, true)) return;
-    Message mssg = create_message(NULL, 0, END_OF_EMULATION, get_current_virtual_for_destroy_message(engine));
-    pdes_comm_send(engine->comm, &mssg);
-    printf("END_OF_EMULATION sent.\n");
-}
-
-void notify_neighbours_of_end(PDESEngine *engine){
-    if(qatomic_xchg(&engine->notified_neighbors_for_exit, true)) return;
-    _send_end_if_handshake_complete(engine);
-}
 // TODO clean this up, destroying needs clean up
 void destroy_strategy(){
     PDESWWT *wwt_engine = get_singleton_wwt_engine();
@@ -129,8 +118,23 @@ void destroy_strategy(){
     }
 }
 void pdes_engine_destroy(PDESEngine *engine) {
-    // Notify neighbors that we are ending the simulation
-    notify_neighbours_of_end(engine);
+    // Additive, log-only: report cumulative guest data moved over the PDES wire (bytes + #chunks).
+    // Gated — only when QFLEX_MEASURE_DATA_MOVEMENT is set (generate-test-communication); off normally.
+    if (pdes_data_measure_enabled()) {
+        uint64_t bs = 0, ms = 0, br = 0, mr = 0;
+        pdes_comm_get_data_stats(&bs, &ms, &br, &mr);
+        printf("[PDES-WIRE] data_bytes_sent=%llu data_msgs_sent=%llu data_bytes_recv=%llu data_msgs_recv=%llu\n",
+               (unsigned long long)bs, (unsigned long long)ms, (unsigned long long)br, (unsigned long long)mr);
+        fflush(stdout);
+    }
+    // By the time we tear down, our exit signal (READY as a peer, or CLEANUP as the master) has
+    // already gone out on a sync — nothing left to announce here.
+    // Sanity count: nonzero is NORMAL at a timing-window end (the window terminates mid-stream);
+    // it is NOT a checkpoint drop — those are persisted by pdes_drain before the save.
+    if (pdes_inflight_count() > 0) {
+        printf("[CKPT-INFLIGHT] exiting with %d undelivered scheduled messages (expected at window end)\n",
+               pdes_inflight_count());
+    }
     if(engine->needs_to_checkpoint){
         // Create bh
         if (!engine->boundry_checkpoint_bh){
@@ -176,7 +180,11 @@ void initiate_checkpoint_master(void *context){
 
     return;
 }
-void set_checkpoint_values_for_master(){
+// Master-side: stage a master-initiated checkpoint of the given name for ALL peers. The name is a
+// parameter (NOT hardcoded to init_warmed) so this is the general "master tells peers to checkpoint"
+// entry point — send_sync then rides CTRL_CKP_REQUEST + this name on the next barrier and each peer
+// adopts it and checkpoints at the agreed round.
+void set_checkpoint_values_for_master(const char *snapshot_name){
     // if master is ready to initiate checkpoint start it
     PDESEngine *engine = get_singleton_engine();
     printf("Master is already initialized, initiating checkpoint immediately.\n");
@@ -184,12 +192,18 @@ void set_checkpoint_values_for_master(){
     engine->notified_neighbors = false;
     engine->needs_to_checkpoint = true;
     engine->checkpoint_format = SNAPSHOT_FORMAT_EXTERNAL_INCREMENTAL_BASE;
-    // TODO this is specific to wwt, need to generalize later, maybe include this in the message
-    PDESWWT *wwt_engine = get_singleton_wwt_engine();
-    engine->checkpoint_quantum_round = wwt_engine->current_quantum_round; // this is specific to wwt, need to generalize later
-    char* snapshot_name = "init_warmed";
+    // Round is NOT chosen here: it is committed when send_sync rides the requires_checkpoint flag on
+    // the next barrier message — the round of that sync is the round both nodes checkpoint at.
     snprintf(engine->checkpoint_name, sizeof(engine->checkpoint_name), "%s", snapshot_name);
-    printf("Setting checkpoint values for master, snapshot name: %s, format: %d, quantum round: %lu\n", engine->checkpoint_name, engine->checkpoint_format, engine->checkpoint_quantum_round);
+    printf("Setting checkpoint values for master, snapshot name: %s, format: %d\n", engine->checkpoint_name, engine->checkpoint_format);
+    // init_warmed is the last coordinated checkpoint of the init phase: flag it final so CTRL_CKP_FINAL
+    // rides the request. Every node (master + peers, including a phantom peer) then writes it and joins the
+    // exit handshake, instead of the master destroying the engine and exiting while peers block in sync and
+    // get SIGKILLed. The master broadcasts CTRL_CLEANUP only once it has every node's CTRL_CKP_DONE
+    // (set post-save), so no node is torn down mid-write.
+    if (strcmp(snapshot_name, "init_warmed") == 0){
+        engine->fw_exit_after_checkpoint = true;
+    }
     // For now skipping
 }
 void process_message(PDESEngine *engine, Message *msg) {
@@ -200,97 +214,30 @@ void process_message(PDESEngine *engine, Message *msg) {
 
     // printf("PDES Engine received message of type %u with timestamp %lu ns and len %u bytes.\n", msg->type, msg->ts_ns, msg->len);
 
-    // TODO both drain start and and end are based on just one neighbor for now, need to generalize later
-    if(msg->type == INTENT_TO_END_EMULATION){
-        if (engine->master){
-            printf("Received intent to end emulation message from neighbor, permitting neighbor to exit and sending permission message back.\n");
-            qatomic_inc(&engine->ready_to_exit_neighbors);
-        }
-    }
-    if (msg->type == PERMISSION_TO_END_EMULATION){
-        printf("Received permission to end emulation; setting permitted_to_exit.\n");
-        qatomic_set(&engine->permitted_to_exit, true);
-        _send_end_if_handshake_complete(engine);
-    }
-    if (msg->type == END_OF_EMULATION){
-        printf("Received END_OF_EMULATION; pair_has_finished.\n");
-        /* Protocol invariant: peer only sends END after the INTENT/PERMISSION
-         * handshake completes. That means our own permitted_to_exit is
-         * already set — master flipped it when granting permission (before
-         * _send_end_if_handshake_complete fires); follower flipped it on
-         * the PERMISSION arm above, which the FIFO shm ring delivers before
-         * the master's END. If this assert fires, the END handshake is
-         * broken upstream — peer exited prematurely. */
-        assert(qatomic_read(&engine->permitted_to_exit)
-               && "process_message: got END_OF_EMULATION before our "
-                  "permitted_to_exit was set. Peer cannot have sent END "
-                  "yet per the INTENT/PERMISSION/END protocol.");
-        qatomic_set(&engine->pair_has_finished, true);
-    }
-    if (msg->type==DRAIN_START){
-        printf("PDES Engine received drain end message, marking drained as true.\n");
-        engine->checkpoint_in_progress = true;
-
-        if (!engine->master){
-            printf("PDES Engine initiating systemic snapshot save after drain.\n");
-            // This is not master so we need to savesnapshot immidiately
-            // TODO change this so the message includes snapshot name
-            // TODO : Ugly solution for now to avoid deadlock:  create a host time timer, call this later, call it immidiately after this
-            // TODO We will get stuck thanks to quanta, need to generalize later
-            Message *msg_copy = g_new(Message, 1);
-            *msg_copy = *msg;
-
-            engine->needs_to_checkpoint = true;
-
-            // TODO verify new snapshot name formatting and parsing, for both send and receive
-            // TODO just turn this into a struct message
-            size_t name_len = msg->len - sizeof(SnapshotFormat) - sizeof(uint64_t);
-            memcpy(engine->checkpoint_name, msg->data, name_len);
-            engine->checkpoint_name[name_len] = '\0'; // null-terminate if needed
-
-            SnapshotFormat format;
-            memcpy(&format, msg->data + name_len, sizeof(SnapshotFormat));
-
-            // read quantum round too, for later use if needed
-            uint64_t quantum_round = 0;
-            if (msg->len >= sizeof(SnapshotFormat) + sizeof(uint64_t)) {
-                memcpy(&quantum_round, msg->data + name_len + sizeof(SnapshotFormat),sizeof(uint64_t));
+    // All control signals now ride the sync (CTRL_* bits in the byte at offset sizeof(round)); they are
+    // therefore consumed at the quantum barrier when sync is on, and immediately (via the poll) when
+    // off. The checkpoint REQUEST (CTRL_CKP_REQUEST) is handled in wwt_recivied_callback (recv_cb,
+    // already run above); here we handle the exit handshake + checkpoint-init effects. PERMISSION is
+    // processed before END so a single sync carrying both keeps the "permitted before END" invariant.
+    if (msg->type == MSG_TYPE_SYNC){
+        uint8_t ctrl = (msg->len > sizeof(uint64_t)) ? msg->data[sizeof(uint64_t)] : 0;
+        if (ctrl & CTRL_CKP_INIT){
+            engine->init_flag++;
+            if (engine->master && engine->init_flag == 1 && engine->master_init){
+                set_checkpoint_values_for_master("init_warmed");
             }
-
-            engine->checkpoint_format = format;
-            engine->checkpoint_quantum_round = quantum_round;
-
-            printf("Parsed checkpoint initiation message, snapshot name: %s, format: %d, quantum round: %lu\n", engine->checkpoint_name, format, quantum_round);
-
-
-
-
-
-        }else{
-            // This variable is only used for master, TODO maybe move this
-            engine->neighbour_drained += 1;
         }
-    }else if (msg->type==DRAIN_END){
-        printf("PDES Engine received drain end message, marking checkpoint as completed.\n");
-        if (!engine->master){
-            // This is not master, we are letting known we can move on with simulation
-            engine->checkpoint_in_progress = false;
+        if ((ctrl & CTRL_READY) && engine->master){
+            qatomic_inc(&engine->ready_peers);   // a peer's Flexus is ready to stop
         }
-    }else if(msg->type==CHECKPOINT_INIT_STEP){
-        printf("PDES Engine received checkpoint initiation message, initiating checkpoint.\n");
-        engine->init_flag++;
-        // TODO expand this into multiple nodes
-        if (engine->master){
-            printf("This is a master, checking if we can initiate checkpoint immediately or need to wait for next initiation message.\n");
-            if (engine->init_flag == 1 && engine->master_init){
-                set_checkpoint_values_for_master();
-            }else{
-                printf("Master received checkpoint initiation message, but master init flag is not set, marking master as ready and waiting for next checkpoint initiation message.\n");
-            }
-        }else{
-            printf("Not a master, just returning after receiving checkpoint initiation message.\n");
+        if ((ctrl & CTRL_CKP_DONE) && engine->master){
+            qatomic_inc(&engine->ckp_done_peers);   // a peer's coordinated checkpoint is on disk
+        }
+        if (ctrl & CTRL_CLEANUP){
+            qatomic_set(&engine->cleanup_received, true);   // master says: terminate
         }
     }
+
 }
 
 void pdes_engine_poll(void *opaque) {
@@ -322,33 +269,12 @@ void schedule_poll(void *opaque){
     timer_mod(engine->msg_rec_poll_timer, qemu_clock_get_ns(QEMU_CLOCK_HOST)+5000000);
 }
 
-void pdes_pause_bh(void *opaque){
-    PDESEngine *engine = opaque;
-
-    vm_stop(RUN_STATE_PAUSED);
-    // Remove the bottom half
-    qemu_bh_delete(engine->pause_bh);
-    engine->pause_bh = NULL;
-}
-#ifndef CONFIG_LIBQFLEX
-// TODO this relies on being on main thread always, add some safeguards for this
-CPUState *paused_cpu = NULL;
-#endif
+/* Flag-only cooperative pause: never stop vCPU threads here (we're on a
+ * virtual-time timer; vm_stop would freeze the recovery timer). PWQ-side
+ * gates in dynamic_barrier.c (MTTCG) and tcg-accel-ops-rr.c (RR) read this. */
 void pdes_pause(void *opaque){
     PDESEngine *engine = opaque;
-
-
-    // Create bh
-    // Make sure bh is empty
-    // assert(engine->pause_bh == NULL && "Pause BH is not NULL when trying to pause, this should not happen");
-    // engine->pause_bh = qemu_bh_new(pdes_pause_bh, engine);
-    // qemu_bh_schedule(engine->pause_bh);
-
-    // qemu_system_vmstop_request_prepare();
-    // qemu_system_vmstop_request(RUN_STATE_PAUSED);
-
-
-    engine->paused = true;
+    qatomic_set(&engine->paused, true);
 #ifdef CONFIG_LIBQFLEX
     if (flexus_api.pause != NULL){
         flexus_api.pause();
@@ -356,39 +282,11 @@ void pdes_pause(void *opaque){
         assert(false && "Flexus resume API is not implemented, but stop API is implemented, this should not happen as both should be implemented together");
     }
 #endif
-
-    assert(engine->pause_bh == NULL);
-    engine->pause_bh = qemu_bh_new(pdes_pause_bh, engine);
-    qemu_bh_schedule(engine->pause_bh);
-
-#ifndef CONFIG_LIBQFLEX
-    if (current_cpu != NULL){
-        paused_cpu = current_cpu;
-        current_cpu->stop = true;
-        // cpu_exit(current_cpu);
-    }
-#endif
-
-
-    return;
 }
 
 
 void pdes_play(void *opaque){
-    // TODO add doc where this can be called from (not virt)
     PDESEngine *engine = opaque;
-    // Create bh
-    // Make sure bh is empty
-    // assert(engine->pause_bh == NULL && "Pause BH is not NULL when trying to play, this should not happen");
-    // engine->pause_bh = qemu_bh_new(play_bh, engine);
-    // qemu_bh_schedule(engine->pause_bh);
-#ifndef CONFIG_LIBQFLEX
-    if (paused_cpu != NULL){
-        paused_cpu->stop = false;
-        paused_cpu = NULL;
-    }
-#endif
-    vm_start();
 #ifdef CONFIG_LIBQFLEX
     if (flexus_api.resume != NULL){
         flexus_api.resume();
@@ -396,44 +294,42 @@ void pdes_play(void *opaque){
         assert(false && "Flexus resume API is not implemented, but stop API is implemented, this should not happen as both should be implemented together");
     }
 #endif
-    engine->paused = false;
-    return;
+    qatomic_set(&engine->paused, false);
 }
 
 
 
+// Persist the link's in-flight traffic across the snapshot. The barrier guarantees nothing with
+// delivery-ts <= the boundary is pending, but messages sent DURING the checkpoint round deliver in the
+// next round (ts=send+latency) — those are real wire state and must survive the cut. Drain the recv
+// ring first so sync=false saves (boot) don't leave unconsumed messages behind either.
 int pdes_drain(PDESEngine *engine, char * snapshot_name, SnapshotFormat format) {
 #ifdef CONFIG_LIBQFLEX
     assert(format == SNAPSHOT_FORMAT_EXTERNAL_INCREMENTAL_BASE && "qemu fork: pdes_drain only supports SNAPSHOT_FORMAT_EXTERNAL_INCREMENTAL_BASE");
 #endif
-    if (engine->master){
-        engine->checkpoint_in_progress = true;
-
-
-
-
-
-        Message drain_end_msg = create_message(NULL, 0, DRAIN_END, get_universal_virtual_time(engine));
-        pdes_comm_send(engine->comm, &drain_end_msg);
-        engine->neighbour_drained = 0;
-
-        printf("Everyone has drained and finished checkpointing.\n");
+    pdes_engine_poll(engine);   // loops until the ring is empty; residue becomes scheduled deliveries
+    if (engine->deferred_normal && !g_queue_is_empty(engine->deferred_normal)) {
+        // These are NOT persisted — saving now would silently drop them. Fail the savevm loudly.
+        printf("[CKPT-INFLIGHT] %s: ERROR %u messages parked in deferred_normal at save (pre-first-sync gate) — aborting snapshot to avoid dropping them\n",
+               snapshot_name, g_queue_get_length(engine->deferred_normal));
+        return -1;
     }
-    pdes_inflight_save_json(snapshot_name);
+    int count = pdes_inflight_count();
+    if (count > 0) {
+        printf("[CKPT-INFLIGHT] %s: saving %d undelivered messages\n", snapshot_name, count);
+        return pdes_inflight_save_json(snapshot_name);
+    }
+    // Remove any stale json from a previous run of this snapshot name, so a re-run can never
+    // restore another run's in-flight traffic.
+    char *stale = get_json_file_name(snapshot_name);
+    unlink(stale);
+    g_free(stale);
+    printf("[CKPT-INFLIGHT] %s: none in flight\n", snapshot_name);
     return 0;
 }
 
 
 
-int send_initiate_checkpoint_message(PDESEngine *engine){
-    // Create a message for checkpoint initiation, with the time being current virtual time
-
-    // TODO add multi-neighbour support to send for everyone
-    Message checkpoint_init_msg = create_message(NULL, 0, CHECKPOINT_INIT_STEP, get_universal_virtual_time(engine));
-    pdes_comm_send(engine->comm, &checkpoint_init_msg);
-    printf("Sent checkpoint initiation message to neighbor.\n");
-    return 0;
-}
 
 void finish_initiate_checkpoint(PDESEngine *engine){
     printf("========================GOT signal for initiate_checkpoint========================\n");
@@ -450,41 +346,26 @@ void finish_initiate_checkpoint(PDESEngine *engine){
 
             // Make sure neighbors know they can checkpoint at end of quantum
             // and set flags for our selves as well
-            set_checkpoint_values_for_master();
+            set_checkpoint_values_for_master("init_warmed");
             printf("Master sent drain start message for checkpoint initiation to neighbors, waiting for neighbors to drain and checkpoint.\n");
         }else{
             printf("Master received checkpoint initiation message, but init flag is not set, marking master as ready and waiting for next checkpoint initiation message.\n");
             return;
         }
     }else{
-        int res = send_initiate_checkpoint_message(engine);
-        assert (res == 0 && "Failed to send checkpoint initiation message to master");
-        printf("Sent checkpoint initiation message to master, returning.\n");
+        engine->pending_ckp_init = true;   // rides the next sync (CTRL_CKP_INIT)
+        printf("Checkpoint init queued on sync for master.\n");
     }
 }
 
 bool can_stop(PDESEngine *engine){
-    /* can_stop runs on the Flexus thread; the flags it touches (and the
-     * counter it reads) are also written from the main thread (process_message,
-     * wwt_sync_check master arm). Use qatomic_* so concurrent updates aren't
-     * lost. intent_sent stays local — only this function ever touches it. */
-    if (!engine->master){
-        if(!engine->intent_sent){
-            Message intent_msg = create_message(NULL, 0, INTENT_TO_END_EMULATION, get_universal_virtual_time(engine));
-            pdes_comm_send(engine->comm, &intent_msg);
-            engine->intent_sent = true;
-        }
-    } else if(qatomic_read(&engine->ready_to_exit_neighbors) >= 1
-             && !qatomic_read(&engine->permitted_to_exit)){
-        qatomic_set(&engine->permitted_to_exit, true);
-        Message permission_msg = create_message(NULL, 0, PERMISSION_TO_END_EMULATION, get_universal_virtual_time(engine));
-        pdes_comm_send(engine->comm, &permission_msg);
-        _send_end_if_handshake_complete(engine);
+    /* Runs on the Flexus thread. Record that this node's Flexus is ready to stop (send_sync reads this
+     * on the main thread to emit CTRL_READY / CTRL_CLEANUP) and report whether we may terminate yet.
+     * Never blocks: the master terminates once it has broadcast CLEANUP, a peer once it has received it.
+     * qatomic because send_sync/process_message touch these on the main thread. */
+    qatomic_set(&engine->self_ready, true);
+    if (engine->master){
+        return qatomic_read(&engine->cleanup_sent);
     }
-    qatomic_set(&engine->ready_to_exit, true);
-    // Both sides exit together: only when our handshake is permitted AND
-    // peer's END has arrived. The natural WWT barrier keeps both ticking
-    // (and exchanging sync) up to that point.
-    return qatomic_read(&engine->permitted_to_exit)
-        && qatomic_read(&engine->pair_has_finished);
+    return qatomic_read(&engine->cleanup_received);
 }

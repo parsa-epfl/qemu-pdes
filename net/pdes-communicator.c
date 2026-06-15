@@ -121,6 +121,9 @@ PDESCommunicator *pdes_comm_create(const char *shm_send_name,
 
 Message create_message(const uint8_t *data, size_t len, uint8_t type, uint64_t ts_ns)
 {
+    assert(len <= MAX_MSG_SIZE &&
+           "PDES: packet exceeds MAX_MSG_SIZE — bump it in pdes-communicator.h "
+           "or disable TSO/GSO in the guest (ethtool -K <iface> tso off gso off)");
     Message msg = {0};
     msg.ts_ns = ts_ns;
     msg.len   = (uint32_t)len;
@@ -151,6 +154,33 @@ void pdes_comm_destroy(PDESCommunicator *comm)
     g_free(comm);
 }
 
+
+/* Additive, log-only: cumulative NORMAL (guest data) traffic moved over the PDES wire — bytes and
+ * message count (= #chunks). Read once at engine teardown; zero effect on timing/behavior. */
+static uint64_t g_pdes_data_bytes_sent = 0, g_pdes_data_msgs_sent = 0;
+static uint64_t g_pdes_data_bytes_recv = 0, g_pdes_data_msgs_recv = 0;
+
+void pdes_comm_get_data_stats(uint64_t *bytes_sent, uint64_t *msgs_sent,
+                              uint64_t *bytes_recv, uint64_t *msgs_recv)
+{
+    if (bytes_sent) *bytes_sent = g_pdes_data_bytes_sent;
+    if (msgs_sent)  *msgs_sent  = g_pdes_data_msgs_sent;
+    if (bytes_recv) *bytes_recv = g_pdes_data_bytes_recv;
+    if (msgs_recv)  *msgs_recv  = g_pdes_data_msgs_recv;
+}
+
+/* Gate: the data counters only accumulate / report when QFLEX_MEASURE_DATA_MOVEMENT is set in the
+ * environment (the `generate-test-communication` command sets it). Unset in every normal simulation
+ * → the measurement path is inert (one cached getenv + a branch). Checked once. */
+int pdes_data_measure_enabled(void)
+{
+    static int en = -1;
+    if (en < 0) {
+        const char *v = getenv("QFLEX_MEASURE_DATA_MOVEMENT");
+        en = (v && *v) ? 1 : 0;
+    }
+    return en;
+}
 
 int pdes_comm_send(PDESCommunicator *comm, Message *msg)
 {
@@ -186,6 +216,10 @@ int pdes_comm_send(PDESCommunicator *comm, Message *msg)
 
     qatomic_set_mb(&ring->write_idx, next_write);
 
+    if (pdes_data_measure_enabled() && msg->type == MSG_TYPE_NORMAL) {
+        g_pdes_data_bytes_sent += msg->len; ++g_pdes_data_msgs_sent;
+    }
+
     // if(MSG_TYPE_NORMAL == msg->type){
     //     printf("=========================== PDES Engine: Sent message of length %u and of type %u =========================== \n", msg->len, msg->type);
     // }
@@ -208,6 +242,10 @@ int pdes_comm_recv(PDESCommunicator *comm, Message *msg){
     *msg = ring->messages[ring->read_idx];
 
     qatomic_set_mb(&ring->read_idx, (ring->read_idx + 1) % RING_SIZE);
+
+    if (pdes_data_measure_enabled() && msg->type == MSG_TYPE_NORMAL) {
+        g_pdes_data_bytes_recv += msg->len; ++g_pdes_data_msgs_recv;
+    }
 
     // if(MSG_TYPE_NORMAL == msg->type){
     //     printf("=========================== PDES Engine: Received message of length %u and of type %u =========================== \n", msg->len, msg->type);

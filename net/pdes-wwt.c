@@ -9,13 +9,93 @@
 
 #ifdef CONFIG_LIBQFLEX
 #include "middleware/libqflex/libqflex-legacy-api.h"
+#else
+#include "sysemu/quantum.h"
 #endif
+
+// Extra-verbose PDES logging, gated on VERBOSE_PDES=1|true. Each line is prefixed with HOST wall-clock
+// time (docker/machine, not qemu virtual time). For now only the quantum start/end lines use it.
+// Off-path cost is two int comparisons on a cached static (no function call, no formatting); getenv
+// runs once. Only the quantum-frequency hot path needs to stay cheap, so the flag is inlined here.
+static int pdes_verbose_cached = -1;   // -1 = unknown, 0 = off, 1 = on
+static const char *pdes_host_ts(char *buf, size_t n){
+    struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts);
+    struct tm tm; localtime_r(&ts.tv_sec, &tm);
+    size_t off = strftime(buf, n, "%H:%M:%S", &tm);
+    snprintf(buf + off, n - off, ".%03ld", ts.tv_nsec / 1000000);
+    return buf;
+}
+#define PDES_VLOG(fmt, ...) do { \
+    if (pdes_verbose_cached < 0){ const char *_e = getenv("VERBOSE_PDES"); \
+        pdes_verbose_cached = (_e && (!strcmp(_e, "1") || !strcasecmp(_e, "true"))) ? 1 : 0; } \
+    if (pdes_verbose_cached){ char _b[32]; printf("[%s] " fmt, pdes_host_ts(_b, sizeof _b), ##__VA_ARGS__); } \
+} while (0)
 
 extern PDESWWT *singleton_wwt_engine = NULL;
 
 
 PDESWWT *get_singleton_wwt_engine(){
     return singleton_wwt_engine;
+}
+
+/* The intra-machine Parallel Warming Quantum (PWQ) in ns — the across-cores barrier step,
+ * NOT the cross-node MNQ. In the FW build VT advances one PWQ per barrier release; -icount
+ * sets icount_switch_period, -quantum sets quantum_size, and both equal --quantum-size. The
+ * timing build (qemu/) has no PWQ — Flexus tick drives VT one cycle at a time — so 0. */
+static int64_t wwt_pwq_ns(void){
+#ifdef CONFIG_LIBQFLEX
+    return 0;
+#else
+    return (int64_t)(icount_switch_period ? icount_switch_period : quantum_size);
+#endif
+}
+
+/* Boundary-landing tolerance: OUR OWN VT vs OUR expected quantum boundary (a self
+ * check — see wwt_within_drift). This is NOT the cross-node message-skew bound below;
+ * keep the two separate.
+ * Sequential (icount/RR) mode: cpu_budget is capped by deadline-to-next-timer,
+ * so VT lands exactly on every timer — bound is 0.
+ * Parallel (MTTCG/quantum) mode: VT advances by quantum_size per barrier
+ * release, so the round timer can be observed at most one PWQ step past the
+ * boundary — bound is PWQ.
+ * Timing build (qemu/): Flexus tick drives VT, no PWQ — bound is 0. */
+static int64_t wwt_drift_bound_ns(void){
+    return icount_enabled() ? 0 : wwt_pwq_ns();
+}
+
+/* Cross-node message-skew tolerance: how far behind OUR VT a PEER's packet timestamp
+ * may legitimately be — one PWQ. Between barrier releases a synced peer can lag us by at
+ * most one intra-machine quantum step, so a packet it sent can read up to one PWQ behind.
+ * Distinct from wwt_drift_bound_ns(): in icount mode that self bound is 0 while this skew
+ * bound is still PWQ (the quantum size), so do not merge the two. 0 in the timing build,
+ * where Flexus ticks lockstep and there is no PWQ. */
+static int64_t wwt_msg_skew_bound_ns(PDESWWT *wwt){
+    (void)wwt;
+    return wwt_pwq_ns();
+}
+
+/* |actual - expected| <= wwt_drift_bound_ns(). Two-sided — for the quantum
+ * boundary sync check where actual must equal expected within tolerance. */
+static bool wwt_within_drift(int64_t actual, int64_t expected){
+    int64_t drift = actual - expected;
+    int64_t bound = wwt_drift_bound_ns();
+    return drift >= -bound && drift <= bound;
+}
+
+/* Open the NORMAL-message gate once BOTH our first sync is set up (sent_first_sync, so
+ * first_sync_virtual_time is real) AND the peer's first sync has arrived
+ * (received_first_sync). Replays any NORMAL packets parked while the gate was shut — they
+ * now translate into the correct frame. SYNC is never gated, so this can't deadlock. */
+static void wwt_open_first_sync_gate(PDESWWT *wwt_engine){
+    PDESEngine *engine = wwt_engine->engine;
+    if (engine->has_first_sync) return;
+    if (!(engine->sent_first_sync && engine->received_first_sync)) return;
+    engine->has_first_sync = true;
+    Message *m;
+    while ((m = (Message *)g_queue_pop_head(engine->deferred_normal)) != NULL){
+        wwt_recivied_callback(wwt_engine, m);   /* gate now open -> processed normally */
+        g_free(m);
+    }
 }
 
 int64_t get_current_virtual_for_sync_message(PDESEngine *engine) {
@@ -29,7 +109,8 @@ PDESWWT *pdes_engine_wwt_create(
     int64_t latencyns,
     PDESFinalRecvCallback cb,
     void *opaque,
-    bool master
+    bool master,
+    bool phantom
 ){
 
     assert(singleton_wwt_engine == NULL && "Singleton wwt engine already created");
@@ -55,7 +136,8 @@ PDESWWT *pdes_engine_wwt_create(
         is_waiting_for_quanta,
         wwt,
         time_to_setup,
-        master
+        master,
+        phantom
     );
 
 
@@ -81,9 +163,14 @@ PDESWWT *pdes_engine_wwt_create(
 
     singleton_wwt_engine = wwt;
 
-    if (wwt->should_sync){
-        icount_set_sleep(false);
-    }
+    /* Disable icount sleep unconditionally — PDES message delivery uses
+     * QEMU_CLOCK_VIRTUAL timers (see wwt_recivied_callback) regardless of
+     * sync mode. Under sync=false with the default icount_sleep=true, the
+     * main loop can sleep through quiet windows and never advance virtual
+     * time to the delivery deadline, so queued messages sit forever and
+     * the wire looks dead (0% ping reception). Under sync=true this was
+     * already in place; just need it on too when sync=false. */
+    icount_set_sleep(false);
 
 
     return wwt;
@@ -105,6 +192,14 @@ void setup_wwt(PDESWWT *wwt_engine){
     //TODO change this name to setup wwt
     wwt_engine->engine->first_sync_virtual_time = current_time;
     printf("WWT: Setup called, setting first sync virtual time to %lu ns.\n", current_time);
+
+    /* Our virtual-time base (first_sync_virtual_time) is now real. Mark it, and open the
+     * NORMAL-message gate if the peer's first sync already arrived. Until the gate is open,
+     * NORMAL packets are parked (see wwt_recivied_callback) so none is time-compared while
+     * first_sync_virtual_time is still its create-time 0 — which is what produced the
+     * "message in the past" aborts. */
+    wwt_engine->engine->sent_first_sync = true;
+    wwt_open_first_sync_gate(wwt_engine);
 
     PDESWWT *wwt = wwt_engine;
 
@@ -133,16 +228,72 @@ void setup_wwt(PDESWWT *wwt_engine){
     // TODO address the bug that may be caused without sync (as you can see multiple sync messages at once)
     wwt_engine->number_of_neighbors_finished = 0;
     printf("WWT: Setup starting at virtual time %lu ns and universal time off: %lu ns.\n", current_time, get_universal_virtual_time(wwt_engine->engine));
-    // TODO increasing this for when resource contention can happen when running things in parallel, needs a better cleaner solution
-    // 500ms one-shot defers the receive poll past first sync; without it a packet that arrives before our first sync goes out can be processed early and break time-bias setup
-    timer_mod(wwt_engine->engine->msg_rec_poll_timer, qemu_clock_get_ns(QEMU_CLOCK_HOST)+500000000); // 500 milliseconds, just the first time
+    // Kick the receive poll now; the first-sync gate (not a timing delay) is what keeps
+    // NORMAL packets from being processed before our base is set, so the old 500ms one-shot
+    // deferral is no longer needed.
+    timer_mod(wwt_engine->engine->msg_rec_poll_timer, qemu_clock_get_ns(QEMU_CLOCK_HOST));
 }
 
 void send_sync(PDESWWT *wwt_engine){
+    PDESEngine *engine = wwt_engine->engine;
+    uint8_t buf[1006];
     uint64_t round = wwt_engine->current_quantum_round;
-    Message sync_msg = create_message((uint8_t *)&round, sizeof(round), MSG_TYPE_SYNC, get_current_virtual_for_sync_message(wwt_engine->engine));
-    pdes_engine_send(wwt_engine->engine, &sync_msg);
-    // printf("WWT: Sent sync message for round %lu at virtual time %lu ns.\n", round, get_universal_virtual_time(wwt_engine->engine));
+    memcpy(buf, &round, sizeof(round));               // [0..8) round
+    size_t off = sizeof(round) + 1;                   // [8] = CTRL_* bitmask
+    uint8_t ctrl = 0;
+    // Checkpoint REQUEST rides the barrier message: the round we flag is the round both nodes
+    // checkpoint at. A peer cannot cross this round without first consuming this sync, so it learns the
+    // round before it can pass it — no announcement lag. notified_neighbors is the "already flagged" latch.
+    // MASTER-ONLY: only the master announces. In FW every node's save_snapshot sets needs_to_checkpoint
+    // locally, so a peer would otherwise self-announce, set notified_neighbors, and then refuse to adopt
+    // the master's request — keeping its own (non-QPDES) name + round, which validate_checkpoint skips.
+    if (engine->master && engine->needs_to_checkpoint && !engine->notified_neighbors){
+        ctrl |= CTRL_CKP_REQUEST;
+        if (engine->fw_exit_after_checkpoint){
+            ctrl |= CTRL_CKP_FINAL;   // last FW snapshot: peer joins the exit handshake after writing it
+            PDES_VLOG("WWT: flagging CTRL_CKP_FINAL on checkpoint %s (FW exit).\n", engine->checkpoint_name);
+        }
+        engine->notified_neighbors = true;
+        engine->checkpoint_quantum_round = round;     // commit: checkpoint at this round
+        memcpy(buf + off, &engine->checkpoint_format, sizeof(SnapshotFormat));
+        off += sizeof(SnapshotFormat);
+        // Prepend "QPDES" so the peer's validate_checkpoint admits a non-master save.
+        int n = snprintf((char *)(buf + off), sizeof(buf) - off, "QPDES%s", engine->checkpoint_name);
+        off += (size_t)n + 1;                         // include the null terminator
+    }
+    // Checkpoint-init: peer->master "ready to checkpoint", rides the sync once.
+    if (qatomic_xchg(&engine->pending_ckp_init, false)) ctrl |= CTRL_CKP_INIT;
+    // Checkpoint-done report: peer->master "my checkpoint is on disk". Set ONLY in create_checkpoint_bh
+    // after save_snapshot returns, so it can never ride a sync before the write.
+    if (qatomic_xchg(&engine->pending_ckp_done, false)) ctrl |= CTRL_CKP_DONE;
+    // A non-master only announces it is done (CTRL_READY in timing, CTRL_CKP_DONE post-save in a
+    // checkpoint) and otherwise waits for the master's CLEANUP — it never looks at peers. The master
+    // alone decides: once its own work is done (self_ready) and it has counted a done-report from every
+    // peer, it sends the one CLEANUP flag.
+    bool sending_cleanup = false;
+    if (!engine->master){
+        if (qatomic_read(&engine->self_ready) && !engine->ready_sent){
+            ctrl |= CTRL_READY;
+            engine->ready_sent = true;
+        }
+    } else {
+        int peers_done = engine->fw_exit_after_checkpoint
+            ? qatomic_read(&engine->ckp_done_peers)
+            : qatomic_read(&engine->ready_peers);
+        if (qatomic_read(&engine->self_ready)
+                && peers_done >= wwt_engine->number_of_neighbors
+                && !qatomic_read(&engine->cleanup_sent)){
+            ctrl |= CTRL_CLEANUP;
+            sending_cleanup = true;
+        }
+    }
+    buf[sizeof(round)] = ctrl;
+    Message sync_msg = create_message(buf, off, MSG_TYPE_SYNC, get_current_virtual_for_sync_message(engine));
+    pdes_engine_send(engine, &sync_msg);
+    // Mark cleanup_sent only AFTER the CLEANUP is in shm, so the master (whose can_stop runs on the
+    // Flexus thread) can never terminate before the peer can see CLEANUP.
+    if (sending_cleanup) qatomic_set(&engine->cleanup_sent, true);
+    // printf("WWT: Sent sync message for round %lu at virtual time %lu ns (ctrl=0x%02x).\n", round, get_universal_virtual_time(engine), ctrl);
 }
 void finish_quantum(PDESWWT *wwt_engine){
     send_sync(wwt_engine);
@@ -169,6 +320,11 @@ void wwt_recivied_callback(void *opaque, Message *msg){
 
     if(msg->type == MSG_TYPE_SYNC){
         // Received sync message from neighbor
+
+        /* SYNC is never gated. Record the peer's first sync and open the NORMAL gate when
+         * both sides' first syncs are in (replays any parked NORMAL packets). */
+        wwt_engine->engine->received_first_sync = true;
+        wwt_open_first_sync_gate(wwt_engine);
 
         // assert that time difference between nodes can not be more than quanta
         // TODO removed due to the host time poll of underlying engine causing issues, needs to be fixed later, should be ok for later syncs still
@@ -197,10 +353,49 @@ void wwt_recivied_callback(void *opaque, Message *msg){
             }
             assert (valid_round && "Received sync message for wrong quantum round, this should not happen");
         }
-        sync_count_increment(wwt_engine->sync_counts, msg_round);
+        // sync_count drives the barrier, which is only used when syncing; skip it when off so we don't
+        // grow the hash for the empty syncs we now emit every quantum while sync is off.
+        if (wwt_engine->should_sync){
+            sync_count_increment(wwt_engine->sync_counts, msg_round);
+        }
         // printf("WWT: Sync received for round %lu (count now %d)\n", msg_round, sync_count_get(wwt_engine->sync_counts, msg_round));
 
+        // Checkpoint request rides the barrier message. We consume this sync to cross msg_round, so we
+        // adopt the checkpoint (round = msg_round, plus the master's name/format) before we can pass it,
+        // even if we are already sitting at the end of the quantum.
+        uint8_t ctrl = (msg->len > sizeof(uint64_t)) ? msg->data[sizeof(uint64_t)] : 0;
+        if ((ctrl & CTRL_CKP_REQUEST) && !wwt_engine->engine->notified_neighbors){
+            PDESEngine *engine = wwt_engine->engine;
+            engine->needs_to_checkpoint = true;
+            engine->notified_neighbors = true;        // committed; we do not re-flag our own sync
+            engine->checkpoint_quantum_round = msg_round;
+            size_t off = sizeof(uint64_t) + 1;
+            memcpy(&engine->checkpoint_format, msg->data + off, sizeof(SnapshotFormat));
+            off += sizeof(SnapshotFormat);
+            snprintf(engine->checkpoint_name, sizeof(engine->checkpoint_name), "%s", (const char *)(msg->data + off));
+            // printf("[CKPT] adopted checkpoint via sync flag: round=%lu name=%s\n", msg_round, engine->checkpoint_name);
+            if (ctrl & CTRL_CKP_FINAL){
+                engine->fw_exit_after_checkpoint = true;   // exit after this (final FW/init) checkpoint lands
+                PDES_VLOG("WWT: adopted CTRL_CKP_FINAL; will exit after checkpoint round %lu.\n", msg_round);
+                // No phantom special-casing: like any peer (phantom or not) this node sends CTRL_CKP_DONE in
+                // create_checkpoint_bh AFTER writing this checkpoint, and the master's checkpoint-exit gate
+                // waits for it before CLEANUP — so this savevm is never cut short, whatever self_ready was.
+            }
+        }
+
     } else if (msg->type == MSG_TYPE_NORMAL){
+        /* Gate: until the first-sync handshake establishes our time base, park NORMAL
+         * packets instead of time-comparing them — otherwise first_sync_virtual_time is
+         * still its create-time 0 and the raw inter-node VT gap reads as a huge "in the
+         * past". Only when syncing (with sync off there's no base to wait for and no skew
+         * check, and the gate would never open). Parked packets are replayed in order by
+         * wwt_open_first_sync_gate once the gate opens. */
+        if (wwt_engine->should_sync && !wwt_engine->engine->has_first_sync) {
+            Message *copy = g_new(Message, 1);
+            *copy = *msg;
+            g_queue_push_tail(wwt_engine->engine->deferred_normal, copy);
+            return;
+        }
         // Normal message, pass to final callback
         // Use message timestamp to process it later at correct virtual time
         MessageReceiveContext *ctx = g_new0(MessageReceiveContext, 1);
@@ -213,12 +408,25 @@ void wwt_recivied_callback(void *opaque, Message *msg){
 
         // Process at schedule or now + 1 which ever is later
         if (wwt_engine->should_sync) {
-            // If should sync, process exactly at timestamp and throw an error if its in the past
+            /* A peer's packet may be up to one PWQ (intra-machine quantum step) behind our
+             * VT: between barrier releases the peer can lag us by one quantum step. Use the
+             * message-skew bound (NOT wwt_drift_bound_ns(), which is the boundary-landing
+             * self bound — 0 in icount and in the timing build). Future timestamps are
+             * always fine; the clamp below delivers a slightly-past packet in order. */
+            int64_t bound = wwt_msg_skew_bound_ns(wwt_engine);
+            if (translated_time + bound < current_virtual_time_translated) {
+                printf("WWT Engine received message with timestamp %lu ns while current virtual time is %lu (skew bound %ld)\n",
+                       translated_time, current_virtual_time_translated, bound);
+                assert(false && "Received message with timestamp more than one quantum in the past while should_sync is enabled");
+            }else if (translated_time < current_virtual_time_translated){
+                printf("[DRIFT] WWT Engine received message with timestamp %lu ns while current virtual time is %lu ns, but it's within the skew bound of %ld ns, so accepting it.\n",
+                       translated_time, current_virtual_time_translated, bound);
+            }
+            /* Clamp to current time so the scheduled processing timer can't be
+             * mod'd to a past virtual time, which would fire immediately and
+             * defeat the in-order delivery the WWT protocol relies on. */
             if (translated_time < current_virtual_time_translated) {
-                // Should not happen
-                printf("WWT Engine received message with timestamp %lu ns while current virtual time is %lu\n", translated_time, current_virtual_time_translated);
-                // TODO IMPORTANT address this properly later
-                assert(false && "Received message with timestamp in the past while should_sync is enabled");
+                processing_time = current_virtual_time_translated;
             }
         }else{
             processing_time = (translated_time > current_virtual_time_translated + 1) ? translated_time : current_virtual_time_translated + 1;
@@ -229,8 +437,9 @@ void wwt_recivied_callback(void *opaque, Message *msg){
         // calculate time diffrence in seconds (not ns) and print in how many seconds the message will be processed
         // printf("Message will be processed in %.3f seconds at virtual time %lu ns (current virtual time is %lu ns, translated message time is %lu ns).\n", time_diff_sec, processing_time, current_virtual_time_translated, translated_time);
         timer_mod(ctx->one_time_poll_timer, raw_processing_time);
-        // TODO remove inflight things
-        // pdes_inflight_add(msg, raw_processing_time);
+        // Track until delivered: messages sent during a quantum deliver in the NEXT one (ts=send+latency),
+        // so at a checkpoint barrier this set is the link's in-flight traffic — pdes_drain persists it.
+        pdes_inflight_add(msg, raw_processing_time);
 
         // printf("WWT_RECV: msg_ts=%ld universal_now=%ld raw_processing=%ld FST=%ld\n",
         // translated_time, current_virtual_time_translated, raw_processing_time,
@@ -264,50 +473,16 @@ int64_t get_quantum_time_local(int64_t quantum_round){
 
 
 
-int notify_neighbors_for_drain(PDESEngine *engine, char * snapshot_name, SnapshotFormat format){
-    if(!engine->needs_to_checkpoint){
-        assert(false && "Should not be notifying neighbors for drain if we don't need to checkpoint");
-    }
-    if (engine->notified_neighbors){
-        return 0;
-    }
-    engine->notified_neighbors = true;
-    printf("Notifying neighbors for drain with snapshot name: %s and format: %d\n", snapshot_name, format);
-    uint8_t snapshot_name_data[1006];
-    int n = snprintf((char *)snapshot_name_data, sizeof(snapshot_name_data),
-                    "QPDES%s", snapshot_name ? snapshot_name : "");
-    if (n < 0) {
-        // encoding/format error
-        return -1;
-    }
-
-    if (n >= sizeof(snapshot_name_data)) {
-        // Output was truncated, handle the error
-        fprintf(stderr, "Snapshot name is too long and was truncated\n");
-        return -1;
-    }
-    snprintf((char *)snapshot_name_data, sizeof(snapshot_name_data), "QPDES%s", snapshot_name);
-    // Validate this formatting of string, for both send and receive
-    memcpy(snapshot_name_data + n, &format, sizeof(SnapshotFormat));
-    size_t total_len = (size_t)n + sizeof(SnapshotFormat);
-
-    // Add in quantum round too:
-    // TODO this is specific to wwt, need to generalize
-    uint64_t quantum_round = get_singleton_wwt_engine()->current_quantum_round;
-    memcpy(snapshot_name_data + total_len, &quantum_round, sizeof(quantum_round));
-    total_len += sizeof(quantum_round);
-
-    Message drain_start_msg = create_message(snapshot_name_data, total_len, DRAIN_START, get_universal_virtual_time(engine));
-    pdes_comm_send(engine->comm, &drain_start_msg);
-    printf("notified neighbours with drain start message with snapshot name: %s with size %zu and sent it\n", snapshot_name_data, (size_t)n);
-}
 
 bool sync_checkpoint_check(){
     PDESWWT *wwt_engine = get_singleton_wwt_engine();
-    if(wwt_engine->engine->needs_to_checkpoint){
-        if(!wwt_engine->engine->notified_neighbors){
-            notify_neighbors_for_drain(wwt_engine->engine, wwt_engine->engine->checkpoint_name, wwt_engine->engine->checkpoint_format);
-        }
+    // Only act once the checkpoint round is committed: notified_neighbors is set the moment the
+    // requires_checkpoint flag rides a sync (send_sync on the initiator, or the adopt path on a peer),
+    // which is also when checkpoint_quantum_round is set. Before that the round isn't known.
+    if(wwt_engine->engine->needs_to_checkpoint && wwt_engine->engine->notified_neighbors){
+        // printf("[CKPT] sync_checkpoint_check: master=%d current_round=%lu ckpt_round=%lu notified=%d should_sync=%d\n",
+        //        wwt_engine->engine->master, wwt_engine->current_quantum_round,
+        //        wwt_engine->engine->checkpoint_quantum_round, wwt_engine->engine->notified_neighbors, wwt_engine->should_sync);
         // Create bh and reschedule this again
         if ((wwt_engine->current_quantum_round < wwt_engine->engine->checkpoint_quantum_round) && wwt_engine->should_sync){
             printf("Checkpoint quantum round %lu is less than current quantum round %lu\n", wwt_engine->engine->checkpoint_quantum_round, wwt_engine->current_quantum_round);
@@ -345,41 +520,34 @@ void wwt_sync_check(){
     while(waiting){
         // Poll for messages while waiting to avoid blocking message processing
         pdes_engine_poll(wwt_engine->engine);
-        // Peer sent END_OF_EMULATION. Per the protocol, peer can only send
-        // END after the INTENT/PERMISSION exchange completed, which means
-        // OUR permitted_to_exit is already set — master sets it when
-        // granting permission (before _send_end_if_handshake_complete);
-        // follower sets it when receiving PERMISSION (which arrives before
-        // master's END in send order). So we were already ready to exit
-        // when peer's END landed, and the only honest thing to do is exit
-        // here instead of spinning waiting for a sync that will never come.
-        if (qatomic_read(&wwt_engine->engine->pair_has_finished)){
-            assert(qatomic_read(&wwt_engine->engine->permitted_to_exit)
-                   && "wwt_sync_check: pair_has_finished is set but our "
-                      "permitted_to_exit isn't — peer sent END_OF_EMULATION "
-                      "before our handshake completed. The END handshake "
-                      "invariant is broken upstream (check process_message "
-                      "PERMISSION arm and the master arm in wwt_sync_check / "
-                      "can_stop).");
+        // Terminate from the main thread if we may stop now (master: CLEANUP sent; peer: CLEANUP
+        // received). Needed because Flexus is paused at the barrier and can't poll can_stop itself, and
+        // because the peer that sent us CLEANUP/READY may have stopped sending further syncs — so we
+        // must not spin waiting for a sync that will never come. Our own exit signal already went out:
+        // the master's CLEANUP is in shm before cleanup_sent is set; a peer has already sent its READY.
+        bool may_stop = wwt_engine->engine->master
+                            ? qatomic_read(&wwt_engine->engine->cleanup_sent)
+                            : qatomic_read(&wwt_engine->engine->cleanup_received);
+        if (may_stop){
+            PDES_VLOG("WWT: exit handshake complete (master=%d), terminating.\n", wwt_engine->engine->master);
 #ifdef CONFIG_LIBQFLEX
             if (flexus_api.stop != NULL){
-                /* Drive Flexus's terminateSimulation from the main thread.
-                 * Flexus thread is paused (pdes_pause from a prior
-                 * quanta_sync) so Flexus internals are quiescent; this is
-                 * the same path the Flexus-side stopcycle check would have
-                 * taken on its own thread once both flags were set.
-                 * terminateSimulation writes all.measurement.end.log then
-                 * exit(0)s — does not return. */
+                /* terminateSimulation writes all.measurement.end.log then exit(0)s — does not return. */
                 flexus_api.stop();
             }
 #endif
-            /* Belt-and-suspenders: if libqflex is off or flexus_api.stop
-             * unexpectedly returned, fall through to the engine-destroy
-             * path which calls exit(0). */
+            /* FW build (no libqflex): no Flexus to exit us. Tear down the engine and exit(0) so the
+             * final coordinated checkpoint we just wrote is the last thing on disk — this replaces the
+             * WormCache plugin's old premature exit(0) that dropped the last snapshot (999 vs 1000). */
             pdes_engine_destroy(wwt_engine->engine);
-            return; /* unreachable */
+            exit(0);
         }
         waiting = is_waiting_for_quanta(wwt_engine);
+        if (waiting) {
+            // Free the host core between polls — vCPUs are parked at the barrier during this
+            // window, and 50 µs is noise against any real peer wait.
+            g_usleep(50);
+        }
     }
     // printf("WWT: Finished waiting for quanta for round %lu at virtual time %lu ns, proceeding with quantum sync.\n", wwt_engine->current_quantum_round, current_time);
     if (waiting){
@@ -395,19 +563,25 @@ void wwt_sync_check(){
         // TODO Add race condition lock so double checkpoint never happens (reason we double check needs_to_checkpoint)
         bool monitor_virtual_time_drift = wwt_engine->should_sync && (!wwt_engine->engine->skip_boundry_check_after_checkpoint);
         wwt_engine->engine->skip_boundry_check_after_checkpoint = false;
-        monitor_virtual_time_drift = false; // disabled for now TODO add it back in and also fix the problem with checkpointing in non parallel mode
+        monitor_virtual_time_drift = wwt_engine->should_sync; // TODO remove the above and always check later
         if (monitor_virtual_time_drift){
             if (wwt_engine->current_quantum_round > 4){
                 int64_t universal_time = get_universal_virtual_time(wwt_engine->engine);
-                // TODO check why this went to -2
                 int64_t expected_time = get_quantum_time_universal(wwt_engine->current_quantum_round);
-                // IMPORTANT TODO fix this
-                bool validity = universal_time == expected_time;
-                if (!validity) {
-                    printf("Current universal time %lu is not the same as expected quantum time %lu at round %lu, this should not happen\n", universal_time, expected_time, wwt_engine->current_quantum_round);
-                    printf("current real virtual time is %lu\n", qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
+                int64_t drift = universal_time - expected_time;
+                int64_t bound = wwt_drift_bound_ns();
+                if (drift != 0) {
+                    printf("[DRIFT] round=%lu universal=%ld expected=%ld drift=%ld bound=%ld mode=%s\n",
+                           wwt_engine->current_quantum_round, universal_time, expected_time, drift, bound,
+                           icount_enabled() ? "sequential" : "parallel");
                 }
-                assert(validity && "Current universal time should be equal to the quantum time at the end of quanta_sync, if this assertion fails it means that the host time poll of the underlying engine is causing issues with the timing of the quanta sync, needs to be fixed for better sync performance");
+                if (!wwt_within_drift(universal_time, expected_time)) {
+                    printf("Drift exceeds bound: universal=%ld expected=%ld round=%lu drift=%ld bound=%ld mode=%s\n",
+                           universal_time, expected_time, wwt_engine->current_quantum_round, drift, bound,
+                           icount_enabled() ? "sequential" : "parallel");
+                    printf("current real virtual time is %lu\n", qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
+                    assert(false && "Virtual time drifted past allowed bound (0 in sequential, PWQ in parallel).");
+                }
             }
         }
 
@@ -418,29 +592,8 @@ void wwt_sync_check(){
         timer_free(wwt_engine->sync_check_timer);
         wwt_engine->sync_check_timer = NULL;
 
-
-        PDESEngine *engine = wwt_engine->engine;
-        if(engine->master){
-            // TODO again dependant to 2 nodes
-            // TODO make this more general to not be reliant on conservative boundaries
-            // TODO factor it out like the checkpoint portion
-            /* All three flags are cross-thread (set by can_stop on the
-             * Flexus thread and the PERMISSION arm on the main thread); use
-             * qatomic_* so we don't miss an INTENT or double-flip the flag. */
-            if (qatomic_read(&engine->ready_to_exit_neighbors) >= 1
-                && qatomic_read(&engine->ready_to_exit)
-                && !qatomic_read(&engine->permitted_to_exit)){
-                qatomic_set(&engine->permitted_to_exit, true);
-                // Send PERMISSION_TO_END_EMULATION message to neighbor
-                Message permission_to_end_msg = create_message(NULL, 0, PERMISSION_TO_END_EMULATION, get_universal_virtual_time(engine));
-                pdes_comm_send(engine->comm, &permission_to_end_msg);
-                printf("Master received intent to end emulation message, permitting neighbor to exit and sending permission message back.\n");
-                // permitted_to_exit just flipped — flush any END deferred by
-                // notify_neighbours_of_end (Flexus may have asked to exit
-                // before the handshake completed).
-                _send_end_if_handshake_complete(engine);
-            }
-        }
+        // The exit decision (master broadcasting CTRL_CLEANUP once self_ready && all peers ready) lives
+        // entirely in send_sync now — nothing to do here.
 
         // TODO number_of_neighbors_finished should be deprecated
         wwt_engine->number_of_neighbors_finished -= wwt_engine->number_of_neighbors;
@@ -469,7 +622,7 @@ void wwt_sync_check(){
         int64_t next_quantum_time_local = next_quantum_time + wwt_engine->engine->first_sync_virtual_time;
         timer_mod(wwt_engine->quantum_timer, next_quantum_time_local);
         // call play to resume
-        // printf("===================WWT: Finished quantum %lu at virtual time %lu ns and universal time %lu ns.===================\n", wwt_engine->current_quantum_round - 1, current_time, get_universal_virtual_time(wwt_engine->engine));
+        PDES_VLOG("WWT: Finished quantum %lu at virtual time %lu ns and universal time %lu ns.\n", wwt_engine->current_quantum_round - 1, current_time, get_universal_virtual_time(wwt_engine->engine));
         if(wwt_engine->should_sync){
             pdes_play(wwt_engine->engine);
         }
@@ -478,13 +631,20 @@ void wwt_sync_check(){
 
 void quanta_sync(PDESWWT *wwt_engine){
     // Sends sync, pauses and waits for others sync, then resumes
-    // printf("WWT: Starting quantum sync at universal virtual time %lu ns.\n", get_universal_virtual_time(wwt_engine->engine));
     wwt_engine->finished_quantum = true;
     // printf("WWT: Sent sync for quantum %lu at virtual time %lu ns and universal time %lu ns.\n", wwt_engine->current_quantum_round, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL), get_universal_virtual_time(wwt_engine->engine));
 
+    /* Flip pause FIRST so the main-thread warp path
+     * (icount_start_warp_timer in main_loop_wait) sees engine->paused=true
+     * and returns early — otherwise it can advance qemu_icount_bias by the
+     * deadline to the next virtual timer (e.g. a deferred message timer)
+     * while we're still inside pdes_engine_poll on this thread, producing
+     * drift on the order of one VIRTUAL deadline (~hundreds of µs).
+     * Pause is flag-only; processing inbound messages under pause is safe. */
     if(wwt_engine->should_sync){
         pdes_pause(wwt_engine->engine);
     }
+    pdes_engine_poll(wwt_engine->engine);
     // same using is_waiting_for_quanta as setup, as its the same logic
     int64_t current_time = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
     time_test = current_time;
@@ -511,20 +671,16 @@ void quanta_sync(PDESWWT *wwt_engine){
 
     // TODO DOCUMENT THIS MORE: for any operation between nodes that can have potential race conditions, it should be done after pause (to prevent race in node) but before send synnc (to prevent race in the other node)
     // TODO add a lock to engine and everything that needs it. notify neighbor is a good example
-    pdes_engine_poll(wwt_engine->engine);
 
 
 
-    // printf("===================WWT: going to pause for quantum %lu at virtual time %lu ns and universal time %lu ns.===================\n", wwt_engine->current_quantum_round, current_time, get_universal_virtual_time(wwt_engine->engine));
+    PDES_VLOG("WWT: going to pause for quantum %lu at virtual time %lu ns and universal time %lu ns.\n", wwt_engine->current_quantum_round, current_time, get_universal_virtual_time(wwt_engine->engine));
 
-    // Need to send notify neighbors before sync, or else before here and notify the neighbor might move to the next quantum
-    if(wwt_engine->engine->needs_to_checkpoint && !wwt_engine->engine->notified_neighbors){
-        notify_neighbors_for_drain(wwt_engine->engine, wwt_engine->engine->checkpoint_name, wwt_engine->engine->checkpoint_format);
-    }
-    if(wwt_engine->should_sync){
-        // Else you'd fill up buffer
-        send_sync(wwt_engine);
-    }
+    // All control signals (checkpoint + exit handshake) ride the sync, so we emit one every quantum
+    // even when sync is off — otherwise an off node could never deliver a checkpoint/exit signal.
+    // TODO: when sync is off, only emit a sync when it actually carries a CTRL_* flag, to avoid
+    // flooding long sync-off phases (e.g. boot) with empty syncs.
+    send_sync(wwt_engine);
 
 
 
